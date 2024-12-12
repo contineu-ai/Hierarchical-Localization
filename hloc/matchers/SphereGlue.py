@@ -11,7 +11,7 @@ class SG(BaseModel):
     def _init(self,conf):
         default_config = {'K': 2, #Chebyshev filter size
                     'GNN_layers': ['cross'], 
-                    'match_threshold': 1,
+                    'match_threshold': -1,
                     'sinkhorn_iterations':20,
                     'aggr': 'add',
                     'knn': 20,

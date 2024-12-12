@@ -9,14 +9,10 @@ from typing import Dict, List, Optional, Tuple, Union
 import h5py
 import torch
 from tqdm import tqdm
+
 from . import logger, matchers
 from .utils.base_model import dynamic_load
 from .utils.parsers import names_to_pair, names_to_pair_old, parse_retrieval
-from torch_geometric.nn import knn_graph
-from .matchers.SphereGlue import SG
-import numpy as np
-
-
 from .ransac import *  # Assume your ransac methods and 'ransac' object are here
 
 
@@ -24,6 +20,70 @@ params = [0,3920/2,1960/2]
 
 g8p = EightPointAlgorithmGeneralGeometry()
 ransac = RANSAC_8PA()
+
+# Ensure that you have implemented or imported:
+# cam_from_img_vectorized(params, mkpts) and ransac.get_inliers(...) methods.
+
+confs = {
+    "superpoint+lightglue": {
+        "output": "matches-superpoint-lightglue",
+        "model": {
+            "name": "lightglue",
+            "features": "superpoint",
+        },
+    },
+    "disk+lightglue": {
+        "output": "matches-disk-lightglue",
+        "model": {
+            "name": "lightglue",
+            "features": "disk",
+        },
+    },
+    "superglue": {
+        "output": "matches-superglue",
+        "model": {
+            "name": "superglue",
+            "weights": "outdoor",
+            "sinkhorn_iterations": 50,
+        },
+    },
+    "superglue-fast": {
+        "output": "matches-superglue-it5",
+        "model": {
+            "name": "superglue",
+            "weights": "outdoor",
+            "sinkhorn_iterations": 5,
+        },
+    },
+    "NN-superpoint": {
+        "output": "matches-NN-mutual-dist.7",
+        "model": {
+            "name": "nearest_neighbor",
+            "do_mutual_check": True,
+            "distance_threshold": 0.7,
+        },
+    },
+    "NN-ratio": {
+        "output": "matches-NN-mutual-ratio.8",
+        "model": {
+            "name": "nearest_neighbor",
+            "do_mutual_check": True,
+            "ratio_threshold": 0.8,
+        },
+    },
+    "NN-mutual": {
+        "output": "matches-NN-mutual",
+        "model": {
+            "name": "nearest_neighbor",
+            "do_mutual_check": True,
+        },
+    },
+    "adalam": {
+        "output": "matches-adalam",
+        "model": {"name": "adalam"},
+    },
+}
+
 
 class WorkQueue:
     def __init__(self, work_fn, num_threads=1):
@@ -55,81 +115,21 @@ class FeaturePairsDataset(torch.utils.data.Dataset):
         self.pairs = pairs
         self.feature_path_q = feature_path_q
         self.feature_path_r = feature_path_r
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    def sphericalToCartesian(self,phi, theta, radius):
-        x = radius*torch.cos(theta)*torch.sin(phi) 
-        y = radius*torch.sin(theta)*torch.sin(phi) 
-        z = radius*torch.cos(phi)
-        xyz = torch.stack((x,y,z), dim=1)
-        return xyz
-    def PixelToSpherical(self,pixel_coordinates: np.array, imgWidth: int, imgHeight: int):
-        """
-        Convert pixel coordinates to spherical coordinates.
-        Inputs:
-            pixel_coordinates: (N, 2) array of pixel coordinates (x, y).
-            imgWidth: Width of the image in pixels.
-            imgHeight: Height of the image in pixels.
-        Returns:
-            (N, 2) array of spherical coordinates (phi, theta).
-        """
-        x, y = np.hsplit(pixel_coordinates, 2)
-        theta = (1. - (x + 0.5) / imgWidth) * 2 * np.pi
-        phi = ((y + 0.5) * np.pi) / imgHeight
-        return np.hstack((phi, theta))
-
-
-    
-    def __UnitCartesian(self, points):     
-        # Collecting keypoints infocc
-        phi, theta =  torch.split(torch.as_tensor(points), 1, dim=1)
-        unitCartesian = self.sphericalToCartesian(phi, theta, 1)
-        return unitCartesian.squeeze(2)
-        # .to(self.device)
 
     def __getitem__(self, idx):
         name0, name1 = self.pairs[idx]
-        # print (name0, name1)
-        # print (self.feature_path_q)
         data = {}
         with h5py.File(self.feature_path_q, "r") as fd:
             grp = fd[name0]
             for k, v in grp.items():
-                if k == "keypoints":
-
-                    v = torch.from_numpy(self.PixelToSpherical((v.__array__()),tuple(grp["image_size"])[0],tuple(grp["image_size"])[1])).float()
-                    unitCartesian1 = self.__UnitCartesian(v)
-                    data[k + "1"] = torch.from_numpy(v.__array__()).float()
-                    data["unitCartesian1"] = unitCartesian1
-                if k == "descriptors":
-                    data["h1"] = torch.from_numpy(v.__array__()).float().T
-                    # print ("Desc Shpae: ",data["h1"].shape)
-                else:   
-                    data[k + "1"] = torch.from_numpy(v.__array__()).float()
-                    
-                data["image0"] = torch.empty((1,) + tuple(grp["image_size"])[::-1])
-                # edges1 = knn_graph(unitCartesian1, k=self.knn, flow= 'target_to_source', cosine=True)        
-                
+                data[k + "0"] = torch.from_numpy(v.__array__()).float()
+            # some matchers might expect an image but only use its size
+            data["image0"] = torch.empty((1,) + tuple(grp["image_size"])[::-1])
         with h5py.File(self.feature_path_r, "r") as fd:
             grp = fd[name1]
             for k, v in grp.items():
-                # print (k)
-                if k == "keypoints":
-                    # print (v.shape)
-                    v = torch.from_numpy(self.PixelToSpherical((v.__array__()),tuple(grp["image_size"])[0],tuple(grp["image_size"])[1])).float()
-                    # print ("***")
-                    unitCartesian2 = self.__UnitCartesian(v)
-                    data[k + "2"] = torch.from_numpy(v.__array__()).float()
-                    data["unitCartesian2"] = unitCartesian2
-                if k == "descriptors":
-                    data["h" + "2"] = torch.from_numpy(v.__array__()).float().T
-                    # print ("Desc Shpae: ",data["h2"].shape)
-                else:   
-                    # print (v.shape)
-                    data[k + "2"] = torch.from_numpy(v.__array__()).float()
+                data[k + "1"] = torch.from_numpy(v.__array__()).float()
             data["image1"] = torch.empty((1,) + tuple(grp["image_size"])[::-1])
-            # edges2 = knn_graph(unitCartesian2, k=self.knn, flow= 'target_to_source', cosine=True)    
-        
-
         return data
 
     def __len__(self):
@@ -162,12 +162,12 @@ def main(
         features_q = features
         if matches is None:
             raise ValueError(
-                "Either provide both features and matches as Path" " or both as names."
+                "Either provide both features and matches as Path or both as names."
             )
     else:
         if export_dir is None:
             raise ValueError(
-                "Provide an export_dir if features is not" f" a file path: {features}."
+                "Provide an export_dir if features is not a file path: {}".format(features)
             )
         features_q = Path(export_dir, features + ".h5")
         if matches is None:
@@ -175,15 +175,13 @@ def main(
 
     if features_ref is None:
         features_ref = features_q
-    # print (features_q)
-    # print (features_ref)
     match_from_paths(conf, pairs, matches, features_q, features_ref, overwrite)
 
     return matches
 
 
 def find_unique_new_pairs(pairs_all: List[Tuple[str]], match_path: Path = None):
-    """Avoid to recompute duplicates to save time."""
+    """Avoid recomputing duplicates to save time."""
     pairs = set()
     for i, j in pairs_all:
         if (j, i) not in pairs:
@@ -215,13 +213,13 @@ def match_from_paths(
     overwrite: bool = False,
 ) -> Path:
     logger.info(
-        "Matching local features with configuration:" f"\n{pprint.pformat(conf)}"
+        "Matching local features with configuration:\n{}".format(pprint.pformat(conf))
     )
 
     if not feature_path_q.exists():
-        raise FileNotFoundError(f"Query feature file {feature_path_q}.")
+        raise FileNotFoundError(f"Query feature file {feature_path_q} not found.")
     if not feature_path_ref.exists():
-        raise FileNotFoundError(f"Reference feature file {feature_path_ref}.")
+        raise FileNotFoundError(f"Reference feature file {feature_path_ref} not found.")
     match_path.parent.mkdir(exist_ok=True, parents=True)
 
     assert pairs_path.exists(), pairs_path
@@ -229,13 +227,12 @@ def match_from_paths(
     pairs = [(q, r) for q, rs in pairs.items() for r in rs]
     pairs = find_unique_new_pairs(pairs, None if overwrite else match_path)
     if len(pairs) == 0:
-        logger.info("Skipping the matching.")
-        return
+        logger.info("Skipping the matching as everything is already computed.")
+        return match_path
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    # Model = dynamic_load(matchers, conf["model"]["name"])
-    # model = Model(conf["model"]).eval().to(device)
-    model = SG(conf).eval().to(device)
+    Model = dynamic_load(matchers, conf["model"]["name"])
+    model = Model(conf["model"]).eval().to(device)
 
     dataset = FeaturePairsDataset(pairs, feature_path_q, feature_path_ref)
     loader = torch.utils.data.DataLoader(
@@ -249,12 +246,14 @@ def match_from_paths(
             for k, v in data.items()
         }
         pred = model(data)
-        pair = names_to_pair(*pairs[idx])
-        # pred = {k: v.cpu() for k, v in pred.items()}
 
-
-        kpts0 = data['keypoints1'][0].cpu().numpy()
-        kpts1 = data['keypoints2'][0].cpu().numpy()
+        # -------------------------
+        # RANSAC POST-PROCESSING
+        # -------------------------
+        # Extract keypoints and matches from pred
+        # Ensure that 'keypoints0' and 'keypoints1' exist in your feature files
+        kpts0 = data['keypoints0'][0].cpu().numpy()
+        kpts1 = data['keypoints1'][0].cpu().numpy()
         matches0 = pred['matches0'][0].cpu().numpy()
         mconf = pred['matching_scores0'][0].cpu().numpy()
 
@@ -289,18 +288,14 @@ def match_from_paths(
         # Put updated arrays back into pred
         pred['matches0'] = torch.from_numpy(new_matches0[None]).short().to(device)
         pred['matching_scores0'] = torch.from_numpy(new_scores0[None]).half().to(device)
+        # -------------------------
 
-
-
-
-        matches = pred["matches0"][0].cpu().numpy()
-        scores = pred["matching_scores0"][0].cpu().numpy()
-        print ("Matches:", np.sum(matches>0))
+        pair = names_to_pair(*pairs[idx])
         writer_queue.put((pair, pred))
-        del data, pred
-        torch.cuda.empty_cache()
+
     writer_queue.join()
     logger.info("Finished exporting matches.")
+    return match_path
 
 
 if __name__ == "__main__":
@@ -313,4 +308,4 @@ if __name__ == "__main__":
         "--conf", type=str, default="superglue", choices=list(confs.keys())
     )
     args = parser.parse_args()
-    main(confs[args.conf], args.pairs, args.features, args.export_dir)
+    main(confs[args.conf], args.pairs, args.features, args.export_dir, args.matches)

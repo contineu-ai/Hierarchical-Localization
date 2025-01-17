@@ -1,9 +1,6 @@
 import sys
 from pathlib import Path
-
-# sys.path.append("/data/sahil/sfm/accelerated_features")
 sys.path.append(str(Path(__file__).parent / "../third_party/accelerated_features"))
-
 from modules.xfeat import XFeat
 
 import argparse
@@ -405,7 +402,7 @@ def main(
             raise ValueError(
                 f"Provide an export_dir if features is not a file path: {features}"
             )
-        features_q = Path(export_dir, features + ".h5")
+        features_q = Path(export_dir, features)
         if matches is None:
             matches = Path(export_dir, f'{features}_{conf["output"]}_{pairs.stem}.h5')
 
@@ -420,7 +417,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--pairs", type=Path, required=True)
     parser.add_argument("--export_dir", type=Path)
-    parser.add_argument("--features", type=str, default="output_features")
+    parser.add_argument("--features", type=Path)
     parser.add_argument("--matches", type=Path)
     conf = {"output": "matches"}
     args = parser.parse_args()

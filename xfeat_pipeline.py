@@ -16,6 +16,16 @@ def append_vpr_pairs_to_existing(pairs_file, vpr_pairs_file):
     with open(pairs_file, "a") as pairs_file:
         pairs_file.writelines(vpr_pairs)
 
+def run_colmap_mapper(database_path, image_path, output_path):
+    """Run COLMAP's mapper to generate a sparse model."""
+    cmd = [
+        "colmap", "mapper",
+        "--database_path", str(database_path),
+        "--image_path", str(image_path),
+        "--output_path", str(output_path)
+    ]
+    subprocess.run(cmd, check=True)
+
 def main(image_dir, export_dir, num_features, num_matches, vpr_batch_size, vpr_distance_threshold):
     image_dir = Path(image_dir)
     export_dir = Path(export_dir)
@@ -27,19 +37,20 @@ def main(image_dir, export_dir, num_features, num_matches, vpr_batch_size, vpr_d
     matches_file = export_dir / "matches.h5"
     db_path = export_dir / "database.db"
     vpr_pairs_file = export_dir / "image_pairs_vpr.txt"
+    sparse_output_path = export_dir / "sparse"
 
     # Step 1: Extract Features
-    print("[1/5] Extracting features...")
+    print("[1/6] Extracting features...")
     extract_args = [
         "--image_dir", str(image_dir),
         "--output_file", str(features_file),
         "--export_dir", str(export_dir),
         "--num_feat", str(num_features),
     ]
-    # run_script("hloc.extract_xfeat", extract_args)
+    run_script("hloc.extract_xfeat", extract_args)
 
     # Step 2: Generate Image Pairs
-    print("[2/5] Generating image pairs...")
+    print("[2/6] Generating image pairs...")
     pair_args = [
         "--image_folder", str(image_dir),
         "--output_file", str(pairs_file),
@@ -48,7 +59,7 @@ def main(image_dir, export_dir, num_features, num_matches, vpr_batch_size, vpr_d
     run_script("hloc.make_pairs", pair_args)
 
     # Step 3: Run VPR and Append Pairs
-    print("[3/5] Running Visual Place Recognition...")
+    print("[3/6] Running Visual Place Recognition...")
     vpr_args = [
         "--image_folder", str(image_dir),
         "--output_txt", str(vpr_pairs_file),
@@ -61,7 +72,7 @@ def main(image_dir, export_dir, num_features, num_matches, vpr_batch_size, vpr_d
     append_vpr_pairs_to_existing(pairs_file, vpr_pairs_file)
 
     # Step 4: Match Features
-    print("[4/5] Matching features...")
+    print("[4/6] Matching features...")
     match_args = [
         "--pairs", str(pairs_file),
         "--export_dir", str(export_dir),
@@ -71,7 +82,7 @@ def main(image_dir, export_dir, num_features, num_matches, vpr_batch_size, vpr_d
     run_script("hloc.match_xfeat", match_args)
 
     # Step 5: Generate COLMAP Database
-    print("[5/5] Generating COLMAP database...")
+    print("[5/6] Generating COLMAP database...")
     db_args = [
         "--pairs", str(pairs_file),
         "--image_dir", str(image_dir),
@@ -83,8 +94,15 @@ def main(image_dir, export_dir, num_features, num_matches, vpr_batch_size, vpr_d
 
     print(f"COLMAP database generated at: {db_path}")
 
+    # Step 6: Run COLMAP Mapper
+    print("[6/6] Running COLMAP mapper...")
+    sparse_output_path.mkdir(parents=True, exist_ok=True)
+    run_colmap_mapper(db_path, image_dir, sparse_output_path)
+
+    print(f"Sparse model generated at: {sparse_output_path}")
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate a COLMAP database from images using HLOC and VPR.")
+    parser = argparse.ArgumentParser(description="Generate a COLMAP database and sparse model from images using HLOC and VPR.")
     parser.add_argument("--image_dir", type=str, required=True, help="Path to the directory containing images.")
     parser.add_argument("--export_dir", type=str, required=True, help="Path to the directory for export output.")
     parser.add_argument("--num_features", type=int, default=3072, help="Number of features to extract per face.")

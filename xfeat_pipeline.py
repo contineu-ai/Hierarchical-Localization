@@ -8,7 +8,15 @@ def run_script(script_path, args):
     cmd = ["python3", "-m", script_path] + args
     subprocess.run(cmd, check=True)
 
-def main(image_dir, export_dir, num_features, num_matches):
+def append_vpr_pairs_to_existing(pairs_file, vpr_pairs_file):
+    """Append VPR-generated pairs to the existing pairs file."""
+    with open(vpr_pairs_file, "r") as vpr_file:
+        vpr_pairs = vpr_file.readlines()
+    
+    with open(pairs_file, "a") as pairs_file:
+        pairs_file.writelines(vpr_pairs)
+
+def main(image_dir, export_dir, num_features, num_matches, vpr_batch_size, vpr_distance_threshold):
     image_dir = Path(image_dir)
     export_dir = Path(export_dir)
     export_dir.mkdir(parents=True, exist_ok=True)
@@ -18,19 +26,20 @@ def main(image_dir, export_dir, num_features, num_matches):
     pairs_file = export_dir / "image_pairs.txt"
     matches_file = export_dir / "matches.h5"
     db_path = export_dir / "database.db"
+    vpr_pairs_file = export_dir / "image_pairs_vpr.txt"
 
     # Step 1: Extract Features
-    print("[1/4] Extracting features...")
+    print("[1/5] Extracting features...")
     extract_args = [
         "--image_dir", str(image_dir),
         "--output_file", str(features_file),
         "--export_dir", str(export_dir),
         "--num_feat", str(num_features),
     ]
-    run_script("hloc.extract_xfeat", extract_args)
+    # run_script("hloc.extract_xfeat", extract_args)
 
     # Step 2: Generate Image Pairs
-    print("[2/4] Generating image pairs...")
+    print("[2/5] Generating image pairs...")
     pair_args = [
         "--image_folder", str(image_dir),
         "--output_file", str(pairs_file),
@@ -38,8 +47,21 @@ def main(image_dir, export_dir, num_features, num_matches):
     ]
     run_script("hloc.make_pairs", pair_args)
 
-    # Step 3: Match Features
-    print("[3/4] Matching features...")
+    # Step 3: Run VPR and Append Pairs
+    print("[3/5] Running Visual Place Recognition...")
+    vpr_args = [
+        "--image_folder", str(image_dir),
+        "--output_txt", str(vpr_pairs_file),
+        "--batch_size", str(vpr_batch_size),
+        "--distance_threshold", str(vpr_distance_threshold),
+    ]
+    run_script("hloc.vpr", vpr_args)
+    
+    print("Appending VPR pairs to the existing pairs file...")
+    append_vpr_pairs_to_existing(pairs_file, vpr_pairs_file)
+
+    # Step 4: Match Features
+    print("[4/5] Matching features...")
     match_args = [
         "--pairs", str(pairs_file),
         "--export_dir", str(export_dir),
@@ -48,8 +70,8 @@ def main(image_dir, export_dir, num_features, num_matches):
     ]
     run_script("hloc.match_xfeat", match_args)
 
-    # Step 4: Generate COLMAP Database
-    print("[4/4] Generating COLMAP database...")
+    # Step 5: Generate COLMAP Database
+    print("[5/5] Generating COLMAP database...")
     db_args = [
         "--pairs", str(pairs_file),
         "--image_dir", str(image_dir),
@@ -62,11 +84,13 @@ def main(image_dir, export_dir, num_features, num_matches):
     print(f"COLMAP database generated at: {db_path}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate a COLMAP database from images using HLOC.")
+    parser = argparse.ArgumentParser(description="Generate a COLMAP database from images using HLOC and VPR.")
     parser.add_argument("--image_dir", type=str, required=True, help="Path to the directory containing images.")
     parser.add_argument("--export_dir", type=str, required=True, help="Path to the directory for export output.")
     parser.add_argument("--num_features", type=int, default=3072, help="Number of features to extract per face.")
     parser.add_argument("--num_matches", type=int, default=6, help="Number of matches to generate per image.")
+    parser.add_argument("--vpr_batch_size", type=int, default=2, help="Batch size for VPR processing.")
+    parser.add_argument("--vpr_distance_threshold", type=float, default=1, help="Distance threshold for VPR matches.")
 
     args = parser.parse_args()
-    main(args.image_dir, args.export_dir, args.num_features, args.num_matches)
+    main(args.image_dir, args.export_dir, args.num_features, args.num_matches, args.vpr_batch_size, args.vpr_distance_threshold)

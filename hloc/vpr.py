@@ -19,11 +19,11 @@ logger = logging.getLogger(__name__)
 
 # Constants
 TOP_K = 3
-BATCH_SIZE = 1
+BATCH_SIZE = 2
 FRAME_DIFF_THRESHOLD = 10
 FRAME_CLOSENESS_THRESHOLD = 10
-DISTANCE_THRESHOLD = 1.00  # New constant for filtering by feature distance
-IMG_WIDTH = 1920
+DISTANCE_THRESHOLD = 0.5  # New constant for filtering by feature distance
+IMG_WIDTH = 1568
 
 def extract_frame_number(image_path):
     """
@@ -138,7 +138,9 @@ class ImageFolderDataset(Dataset):
             img = cv2.imread(image_path)
             if img is None:
                 raise ValueError(f"Failed to load image: {image_path}")
-                
+            height, width = img.shape[:2]
+            new_height = int((IMG_WIDTH / width) * height)
+            img = cv2.resize(img, (IMG_WIDTH, new_height), interpolation=cv2.INTER_LANCZOS4)
             img = cv2.remap(img, self.map_x_32, self.map_y_32, cv2.INTER_LANCZOS4)
             img = cv2.remap(img, self.map_x_32, self.map_y_32, cv2.INTER_LANCZOS4)
             img = cv2.resize(img,(img.shape[1] // 14 * 14, img.shape[0] // 14 * 14))
@@ -174,7 +176,7 @@ def build_faiss_index(image_folder, model, device, fc_output_dim, batch_size):
         num_workers=4,
         pin_memory=True
     )
-    
+
     features, image_paths = extract_features_batch(dataloader, model, device)
     
     faiss_index = faiss.IndexFlatL2(fc_output_dim)
@@ -246,7 +248,7 @@ def save_results_to_json(results, output_file):
 
 def create_image_pairs_file(results, output_txt_file):
     """Create text file with image pairs."""
-    with open(output_txt_file, 'a') as f:
+    with open(output_txt_file, 'w') as f:
         for result in results:
             query_image = result['query_image']
             for match in result['matches']:
@@ -257,8 +259,7 @@ def create_image_pairs_file(results, output_txt_file):
                        f"{os.path.basename(matched_image)}\n")
     logger.info(f"Image pairs written to {output_txt_file}")
 
-def process_images(image_folder, model, device, fc_output_dim, batch_size, 
-                  output_json=None, output_txt=None):
+def process_images(image_folder, model, device, fc_output_dim, batch_size, output_txt=None):
     """Main processing function."""
     try:
         logger.info(f"Processing images from {image_folder}")
@@ -303,9 +304,6 @@ def process_images(image_folder, model, device, fc_output_dim, batch_size,
         
         logger.info(f"Found {total_pairs} valid matches across {len(results)} queries")
         
-        # Save results
-        if output_json:
-            save_results_to_json(results, output_json)
         if output_txt:
             create_image_pairs_file(results, output_txt)
             
@@ -315,40 +313,50 @@ def process_images(image_folder, model, device, fc_output_dim, batch_size,
         logger.error(f"Error in process_images: {str(e)}")
         raise
 
-if __name__ == "__main__":
-    # Model setup
-    # model = torch.hub.load(
-    #     "gmberton/eigenplaces",
-    #     "get_trained_model",
-    #     backbone="ResNet50",
-    #     fc_output_dim=2048
-    # ).to('cuda')
-    model = torch.hub.load("Ahmedest61/VLAD-BuFF", "vlad_buff", antiburst=True, nv_pca=192, wpca=True, num_pcs=4096).to('cuda')
-    model = model.eval()
+import argparse
+import sys
 
+def main():
+    # Use a local argument parser to avoid conflicts with the library's global arguments
+    parser = argparse.ArgumentParser(description="Run VPR with FAISS")
+    
+    # Define script-specific arguments
+    parser.add_argument("--image_folder", required=True, help="Folder containing images for VPR.")
+    parser.add_argument("--output_txt", required=True, help="Path to save the image pairs TXT.")
+    args, _ = parser.parse_known_args()  # Use `parse_known_args` to avoid unknown argument errors
+    
+    # Model setup
+    sys.argv = [sys.argv[0]]
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Load VLAD-BuFF model without inheriting global CLI arguments
+    logger.info("Loading VLAD-BuFF model...")
+    model = torch.hub.load(
+        "Ahmedest61/VLAD-BuFF",
+        "vlad_buff",
+        antiburst=True,
+        nv_pca=192,
+        wpca=True,
+        num_pcs=4096
+    ).to(device)
+    model.eval()
+    
+    # Transform
+    global transform
     transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
-        ),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
+    
+    # Run VPR processing
+    process_images(
+        image_folder=args.image_folder,
+        model=model,
+        device=device,
+        fc_output_dim=12288,
+        batch_size=BATCH_SIZE,
+        output_txt=args.output_txt
+    )
 
-    # Configuration
-    image_folder = "/data/sahil/data/sahil_test_videos/VID_20240618_114233_002_1"  # Update this path
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    fc_output_dim = 12288
-
-    try:
-        process_images(
-            image_folder=image_folder,
-            model=model,
-            device=device,
-            fc_output_dim=fc_output_dim,
-            batch_size=BATCH_SIZE,
-            output_json="results.json",
-            output_txt="image_pairs_VID.txt"
-        )
-    except Exception as e:
-        logger.error(f"Failed to process images: {str(e)}")
-        raise
+if __name__ == "__main__":
+    main()

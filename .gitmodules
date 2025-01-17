@@ -10,3 +10,6 @@
 [submodule "third_party/r2d2"]
 	path = third_party/r2d2
 	url = https://github.com/naver/r2d2.git
+[submodule "third_party/accelerated_features"]
+	path = third_party/accelerated_features
+	url = git@github.com:contineu-ai/Xfeat.git

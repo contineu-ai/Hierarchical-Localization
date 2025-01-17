@@ -5,7 +5,7 @@ import subprocess
 
 def run_script(script_path, args):
     """Utility function to run a script with given arguments."""
-    cmd = ["python3 -m", script_path] + args
+    cmd = ["python3", "-m", script_path] + args
     subprocess.run(cmd, check=True)
 
 def main(image_dir, export_dir, num_features, num_matches):

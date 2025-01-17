@@ -1,4 +1,5 @@
 import os
+import argparse
 
 def create_image_pairs(image_folder: str, output_file: str = "image_pairs.txt", num_matches: int = 6):
     # Get the list of image files in the folder, sorted alphabetically
@@ -21,6 +22,11 @@ def create_image_pairs(image_folder: str, output_file: str = "image_pairs.txt", 
 
     print(f"Image pairs written to {output_file}")
 
-# Example usage:
-image_folder = "/data/sahil/data/sahil_test_videos/6759a65ed5305e001214c976"
-create_image_pairs(image_folder)
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Create image pairs from a folder of images.")
+    parser.add_argument('--image_folder', type=str, required=True, help="Path to the folder containing images.")
+    parser.add_argument('--output_file', type=str, default="image_pairs.txt", help="Path to the output file.")
+    parser.add_argument('--num_matches', type=int, default=6, help="Number of matches to create for each image.")
+    args = parser.parse_args()
+
+    create_image_pairs(args.image_folder, args.output_file, args.num_matches)

@@ -76,6 +76,7 @@ def import_features(
     db.close()
 
 
+
 def import_matches(
     image_ids: Dict[str, int],
     database_path: Path,
@@ -92,11 +93,17 @@ def import_matches(
     db = COLMAPDatabase.connect(database_path)
 
     matched = set()
+    i=0
     for name0, name1 in tqdm(pairs):
         id0, id1 = image_ids[name0], image_ids[name1]
         if len({(id0, id1), (id1, id0)} & matched) > 0:
             continue
-        matches, scores = get_matches(matches_path, name0, name1)
+        try:
+            matches, scores = get_matches(matches_path, name0, name1)
+        except:
+            i+=1
+            print (name0,name1)
+            continue
         if min_match_score:
             matches = matches[scores > min_match_score]
         db.add_matches(id0, id1, matches)
@@ -104,10 +111,9 @@ def import_matches(
 
         if skip_geometric_verification:
             db.add_two_view_geometry(id0, id1, matches)
-
+    print ("Matches Skipped:",i)
     db.commit()
     db.close()
-
 
 def estimation_and_geometric_verification(
     database_path: Path, pairs_path: Path, verbose: bool = False

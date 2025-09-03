@@ -1,5 +1,6 @@
 import logging
-
+import matplotlib
+matplotlib.use('Agg')
 from packaging import version
 
 __version__ = "1.5"

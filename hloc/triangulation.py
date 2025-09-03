@@ -100,9 +100,10 @@ def import_matches(
             continue
         try:
             matches, scores = get_matches(matches_path, name0, name1)
-        except:
+            # print (name0,name1)
+        except Exception as e:
             i+=1
-            print (name0,name1)
+            print (name0,name1,e)
             continue
         if min_match_score:
             matches = matches[scores > min_match_score]

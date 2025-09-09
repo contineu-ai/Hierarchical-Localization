@@ -48,7 +48,7 @@ def main(pairs, image_dir, export_dir, matches, features):
 
     # Update camera model and parameters in the database
     db_path = export_dir / "database.db"
-    new_camera_model = 11
+    new_camera_model = 12
     new_params = [width * 1.2, width / 2, height / 2]
     change_camera_model_and_parameters(db_path, new_camera_model, new_params)
 

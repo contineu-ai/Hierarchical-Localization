@@ -20,6 +20,9 @@ from functools import lru_cache
 import gc
 import psutil
 import warnings
+import sys
+from pathlib import Path
+
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 # Import CuPy for GPU operations
@@ -176,9 +179,9 @@ class GPU_Convert:
         cubemap_images_dict = self.e2c(img, self.coors_xy)
         return cubemap_images_dict
 
-def cubemap_to_equirectangular_uv(face: str, x: int, y: int, cubemap_size: int):
+def cubemap_to_equirectangular_uv_with_spherical(face: str, x: int, y: int, cubemap_size: int):
     """
-    Convert cubemap face coordinates to equirectangular UV coordinates.
+    Convert cubemap face coordinates to equirectangular UV coordinates AND spherical coordinates.
     This matches the face orientation used in the GPU_Convert class.
     
     Args:
@@ -188,7 +191,7 @@ def cubemap_to_equirectangular_uv(face: str, x: int, y: int, cubemap_size: int):
         cubemap_size (int): Size of the cubemap face
         
     Returns:
-        list: [u, v] coordinates in equirectangular space (0 to 1)
+        dict: {'uv': [u, v], 'spherical': [theta, phi]} coordinates
     """
     # Normalize to [0, 1] range
     x_norm = x / (cubemap_size - 1)
@@ -231,8 +234,8 @@ def cubemap_to_equirectangular_uv(face: str, x: int, y: int, cubemap_size: int):
     # Convert to spherical coordinates (matching GPU_Convert's xyz2uv)
     x_3d, y_3d, z_3d = vec
     
-    # longitude (u) = arctan2(x, z)
-    # latitude (v) = arcsin(y)
+    # longitude (theta) = arctan2(x, z)
+    # latitude (phi) = arcsin(y)
     theta = np.arctan2(x_3d, z_3d)  # longitude
     phi = np.arcsin(y_3d)           # latitude
     
@@ -244,7 +247,10 @@ def cubemap_to_equirectangular_uv(face: str, x: int, y: int, cubemap_size: int):
     u = np.clip(u, 0, 1)
     v = np.clip(v, 0, 1)
     
-    return [u, v]
+    return {
+        'uv': [u, v],
+        'spherical': [theta, phi]  # theta (longitude), phi (latitude)
+    }
 
 class CubemapBatchConverter:
     """Wrapper to handle batch processing with GPU_Convert"""
@@ -640,9 +646,9 @@ class UltraOptimizedFeatureExtractor:
     def _initialize_models(self, yolo_model_path: str, yolo_conf_threshold: float):
         """Initialize XFeat and YOLO models"""
         print("Loading XFeat model...")
-        self.xfeat = torch.hub.load('verlab/accelerated_features', 'XFeat',
-                                   pretrained=True, top_k=self.num_features,
-                                   trust_repo='check').cuda()
+        sys.path.append(str(Path(__file__).parent / "../../Xfeat"))
+        from modules.xfeat import XFeat
+        self.xfeat = XFeat()
         self.xfeat.eval()
         
         # Enable optimizations
@@ -741,29 +747,34 @@ class UltraOptimizedFeatureExtractor:
                            for _ in range(len(dicemap_batch))]
     
     def _convert_coordinates_batch(self, dicemap_keypoints_batch: List[np.ndarray], 
-                                 dicemap_shapes: List[Tuple], eq_shapes: List[Tuple]) -> List[np.ndarray]:
-        """Batch coordinate conversion with vectorized operations"""
-        results = []
+                                 dicemap_shapes: List[Tuple], eq_shapes: List[Tuple]) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+        """Batch coordinate conversion with vectorized operations - returns both equirectangular and spherical coords"""
+        eq_results = []
+        spherical_results = []
         
         for keypoints, dicemap_shape, eq_shape in zip(dicemap_keypoints_batch, dicemap_shapes, eq_shapes):
             if len(keypoints) == 0:
-                results.append(np.zeros((0, 2)))
+                eq_results.append(np.zeros((0, 2)))
+                spherical_results.append(np.zeros((0, 2)))
                 continue
             
             eq_height, eq_width = eq_shape
             face_size = dicemap_shape[0] // 3
             
             # Vectorized coordinate conversion
-            eq_coords = self._dicemap_to_equirect_vectorized(keypoints, face_size, eq_width, eq_height)
-            results.append(eq_coords)
+            eq_coords, spherical_coords = self._dicemap_to_equirect_and_spherical_vectorized(
+                keypoints, face_size, eq_width, eq_height)
+            
+            eq_results.append(eq_coords)
+            spherical_results.append(spherical_coords)
         
-        return results
+        return eq_results, spherical_results
     
-    def _dicemap_to_equirect_vectorized(self, keypoints: np.ndarray, face_size: int,
-                                    eq_width: int, eq_height: int) -> np.ndarray:
-        """Vectorized dicemap to equirectangular conversion using cubemap_to_equirectangular_uv"""
+    def _dicemap_to_equirect_and_spherical_vectorized(self, keypoints: np.ndarray, face_size: int,
+                                    eq_width: int, eq_height: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Vectorized dicemap to both equirectangular and spherical conversion"""
         if len(keypoints) == 0:
-            return np.zeros((0, 2))
+            return np.zeros((0, 2)), np.zeros((0, 2))
 
         # Face layout in dicemap (3 rows × 4 cols):
         #     [   U   ]
@@ -779,6 +790,7 @@ class UltraOptimizedFeatureExtractor:
 
         x_dice, y_dice = keypoints[:, 0], keypoints[:, 1]
         eq_coords = np.zeros((len(keypoints), 2))
+        spherical_coords = np.zeros((len(keypoints), 2))  # [phi, theta] format
 
         for y_min, y_max, x_min, x_max, face_name in face_regions:
             mask = ((x_dice >= x_min) & (x_dice < x_max) &
@@ -790,14 +802,20 @@ class UltraOptimizedFeatureExtractor:
             x_face = x_dice[mask] - x_min
             y_face = y_dice[mask] - y_min
 
-            # Use the provided cubemap_to_equirectangular_uv function for each point
+            # Use the enhanced conversion function for each point
             for idx, (xf, yf) in enumerate(zip(x_face, y_face)):
-                uv = cubemap_to_equirectangular_uv(face_name, int(xf), int(yf), face_size)
+                result = cubemap_to_equirectangular_uv_with_spherical(face_name, int(xf), int(yf), face_size)
                 mask_indices = np.where(mask)[0]
-                eq_coords[mask_indices[idx], 0] = uv[0] * eq_width
-                eq_coords[mask_indices[idx], 1] = uv[1] * eq_height
+                
+                # Store equirectangular coordinates
+                eq_coords[mask_indices[idx], 0] = result['uv'][0] * eq_width
+                eq_coords[mask_indices[idx], 1] = result['uv'][1] * eq_height
+                
+                # Store spherical coordinates [phi, theta] as specified
+                spherical_coords[mask_indices[idx], 0] = result['spherical'][0]  # phi (azimuthal)
+                spherical_coords[mask_indices[idx], 1] = result['spherical'][1]  # theta (polar)
 
-        return eq_coords
+        return eq_coords, spherical_coords
 
     async def process_image_group(self, group_data: List[Tuple[str, np.ndarray]]) -> List[Dict]:
         """Process a group of same-size images"""
@@ -845,13 +863,14 @@ class UltraOptimizedFeatureExtractor:
             feature_results = self._extract_features_batch(dicemap_batch_np)
             self.processing_stats['xfeat_time'].append(time.time() - start_time)
             
-            # Step 5: Coordinate conversion
+            # Step 5: Coordinate conversion (both equirectangular and spherical)
             start_time = time.time()
             dicemap_keypoints = [r['keypoints'] for r in feature_results]
             dicemap_shapes = [img.shape for img in dicemap_batch_np]
             eq_shapes = [img.shape[:2] for img in batch_images]
             
-            eq_keypoints_batch = self._convert_coordinates_batch(dicemap_keypoints, dicemap_shapes, eq_shapes)
+            eq_keypoints_batch, spherical_keypoints_batch = self._convert_coordinates_batch(
+                dicemap_keypoints, dicemap_shapes, eq_shapes)
             self.processing_stats['coord_time'].append(time.time() - start_time)
             
             # Combine results
@@ -878,6 +897,7 @@ class UltraOptimizedFeatureExtractor:
                     'dicemap_descriptors': features['descriptors'],
                     'dicemap_scores': features['scores'],
                     'eq_keypoints': eq_keypoints_batch[j] if j < len(eq_keypoints_batch) else np.zeros((0, 2)),
+                    'spherical_keypoints': spherical_keypoints_batch[j] if j < len(spherical_keypoints_batch) else np.zeros((0, 2)),
                     'detection_stats': detection_stats
                 })
         
@@ -992,6 +1012,7 @@ async def extract_features_ultra_optimized(image_dir: str, output_file: str, exp
                             "dicemap_descriptors": result['dicemap_descriptors'], 
                             "dicemap_scores": result['dicemap_scores'],
                             "keypoints": result['eq_keypoints'],
+                            "spherical_keypoints": result['spherical_keypoints'],  # NEW: Store spherical coordinates
                             "descriptors": result['dicemap_descriptors'],
                             "scores": result['dicemap_scores'],
                             "image_size": result['image_size'],
@@ -1027,18 +1048,19 @@ async def extract_features_ultra_optimized(image_dir: str, output_file: str, exp
     print(f"Successfully processed: {total_processed} images")
     print(f"Output file: {output_file}")
     print(f"Dicemaps saved to: {dicemap_dir}")
+    print(f"Spherical coordinates (theta, phi) saved as 'spherical_keypoints' dataset")
     
     extractor.print_performance_stats()
     extractor.cleanup()
 
 # Command line interface
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Ultra-optimized panoramic feature extraction")
+    parser = argparse.ArgumentParser(description="Ultra-optimized panoramic feature extraction with spherical coordinates")
     parser.add_argument('--image_dir', type=str, required=True, help="Directory containing images")
     parser.add_argument('--output_file', type=str, default="ultra_optimized_features.h5", help="Output HDF5 file")
     parser.add_argument('--export_dir', type=str, default="./export", help="Export directory")
     parser.add_argument('--num_features', type=int, default=3072, help="Number of features to extract")
-    parser.add_argument('--batch_size', type=int, default=128, help="Batch size for processing")
+    parser.add_argument('--batch_size', type=int, default=64, help="Batch size for processing")
     
     # YOLO options
     parser.add_argument('--use_yolo', action='store_true', help="Enable YOLO detection")
@@ -1060,11 +1082,12 @@ if __name__ == "__main__":
         exit(1)
     
     # Run the async extraction
-    print("Starting ultra-optimized feature extraction...")
+    print("Starting ultra-optimized feature extraction with spherical coordinates...")
     print(f"Configuration:")
     print(f"  - Batch size: {args.batch_size}")
     print(f"  - Features: {args.num_features}")
     print(f"  - YOLO enabled: {args.use_yolo}")
+    print(f"  - Spherical coordinates: ENABLED (theta, phi)")
     print(f"  - GPU memory available: {torch.cuda.get_device_properties(0).total_memory // 1024**3}GB")
     
     asyncio.run(extract_features_ultra_optimized(

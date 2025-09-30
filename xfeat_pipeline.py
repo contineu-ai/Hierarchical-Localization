@@ -45,9 +45,9 @@ def run_colmap_mapper(database_path, image_path, output_path):
         "--Mapper.ba_use_gpu", "1",
         "--Mapper.ba_refine_focal_length", "0",
         "--Mapper.ba_refine_extra_params", "0",
-        "--Mapper.abs_pose_max_error", "1.0",
+        "--Mapper.abs_pose_max_error", "2.5",
         "--Mapper.max_reg_trials", "6",
-        "--Mapper.tri_min_angle", "3.5"
+        "--Mapper.tri_min_angle", "4.0",
     ]
     subprocess.run(cmd, check=True)
 
@@ -80,90 +80,20 @@ def main(image_dir, export_dir, num_features, num_matches, yolo_model, yolo_conf
     if additional_pairs_file:
         print(f"Additional pairs file: {additional_pairs_file}")
     print()
-
-    # Step 1: Convert panoramic images to dicemaps
-    print(f"[1/7] Converting panoramic images to dicemaps...")
-    dicemap_args = [
-        "--image_dir", str(image_dir),
-        "--output_dir", str(processing_dir),
-        "--batch_size", str(batch_size)
-    ]
-    if keep_intermediate:
-        dicemap_args.append("--save_cubemaps")
-    
-    run_async_script("hloc.dicemap_converter", dicemap_args)
-
-    # Step 2: Detect and mask humans in dicemaps
-    print(f"[2/7] Detecting and masking humans in dicemaps...")
-    
-    yolo_args = [
-        "--image_dir", str(dicemap_dir),
-        "--model_name", yolo_model,
-        "--output_dir", str(processing_dir / "yolo_results"),
-        "--conf_threshold", str(yolo_conf_threshold),
-        "--batch_size", str(batch_size),
-        "--mask_type", mask_type,
-        "--mask_color"] + [str(c) for c in mask_color]
-    
-    if keep_intermediate:
-        yolo_args.append("--save_detections")
-    
-    run_async_script("hloc.yolo_processor", yolo_args)
-    
-    # Move masked images to expected location
-    masked_source = processing_dir / "yolo_results" / "human_masked"
-    masked_target = processing_dir / "human_masked"
-    if masked_source.exists():
-        if masked_target.exists():
-            import shutil
-            shutil.rmtree(masked_target)
-        masked_source.rename(masked_target)
-
-    # Step 3: Extract features from human-masked dicemaps
-    print(f"[3/7] Extracting features from processed dicemaps...")
-    
-    # Create original shapes file for coordinate conversion
-    shapes_script = f"""
-import h5py
-import cv2
-from pathlib import Path
-
-shapes = {{}}
-for img_path in Path('{image_dir}').glob('*'):
-    if img_path.suffix.lower() in ['.jpg', '.jpeg', '.png', '.tiff', '.bmp']:
-        try:
-            img = cv2.imread(str(img_path))
-            if img is not None:
-                h, w = img.shape[:2]
-                shapes[img_path.name] = (w, h)
-        except Exception as e:
-            print(f"Warning: Could not read {{img_path}}: {{e}}")
-
-with h5py.File('{export_dir / "temp_shapes.h5"}', 'w') as f:
-    for img_name, (w, h) in shapes.items():
-        name_only = img_name.split('.')[0]
-        grp = f.create_group(name_only)
-        grp.create_dataset("image_size", data=[w, h])
-print(f"Saved {{len(shapes)}} original image dimensions")
-"""
-    with open(export_dir / "create_shapes.py", "w") as f:
-        f.write(shapes_script)
-    subprocess.run(["python3", str(export_dir / "create_shapes.py")], check=True)
     
     feature_args = [
-        "--dicemap_dir", str(final_image_dir),
+        "--image_dir", str(image_dir),
         "--output_file", str(features_file),
-        "--original_shapes_file", str(export_dir / "temp_shapes.h5"),
         "--num_features", str(num_features),
         "--batch_size", str(batch_size)
     ]
     
-    run_async_script("hloc.extract_xfeat_only", feature_args)
+    run_async_script("hloc.unify", feature_args)
 
     # Step 4: Generate image pairs
     print(f"[4/7] Generating image pairs...")
     pair_args = [
-        "--image_folder", str(final_image_dir),
+        "--image_folder", str(image_dir),
         "--output_file", str(pairs_file),
         "--num_matches", str(num_matches),
     ]
@@ -180,6 +110,8 @@ print(f"Saved {{len(shapes)}} original image dimensions")
         "--pairs", str(pairs_file),
         "--features", str(features_file),
         "--output", str(matches_file),
+        "--max_keypoints", str(num_features),
+        
     ]
     
     run_script("hloc.match_xfeat", match_args)
@@ -204,21 +136,7 @@ print(f"Saved {{len(shapes)}} original image dimensions")
 
     print(f"Sparse model generated at: {sparse_output_path}")
 
-    # # Cleanup temporary files
-    # if not keep_intermediate:
-    #     print("\nCleaning up intermediate files...")
-    #     temp_files = [
-    #         export_dir / "temp_shapes.h5",
-    #         export_dir / "create_shapes.py"
-    #     ]
-    #     for temp_file in temp_files:
-    #         if temp_file.exists():
-    #             temp_file.unlink()
-        
-    #     import shutil
-    #     if processing_dir.exists():
-    #         shutil.rmtree(processing_dir)
-    #         print(f"Removed processing directory: {processing_dir}")
+
 
     print(f"\n=== Pipeline Complete ===")
     print(f"Sparse model: {sparse_output_path}")
@@ -234,7 +152,7 @@ if __name__ == "__main__":
     parser.add_argument("--export_dir", type=str, required=True, help="Export directory")
     parser.add_argument("--num_features", type=int, default=3072, help="Features per dicemap")
     parser.add_argument("--num_matches", type=int, default=6, help="Matches per image")
-    parser.add_argument("--batch_size", type=int, default=128, help="Processing batch size")
+    parser.add_argument("--batch_size", type=int, default=96, help="Processing batch size")
     
     # Human detection - always enabled
     parser.add_argument("--yolo_model", type=str, default="yolo11m.pt", 

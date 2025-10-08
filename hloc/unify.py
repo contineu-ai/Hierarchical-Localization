@@ -1,12 +1,5 @@
 """
-Optimized Unified GPU Pipeline for Panoramic Image Processing
-Key Optimizations:
-- Reduced CPU-GPU transfers by 60%
-- Vectorized coordinate conversion on GPU
-- Direct dicemap assembly without intermediate dict
-- Efficient memory pooling and reuse
-- Prefetching for I/O operations
-- Optimized batch processing
+Refactored Unified GPU Pipeline - Uses Centralized Config
 """
 
 import numpy as np
@@ -17,7 +10,8 @@ import argparse
 import time
 import os
 import gc
-from typing import List, Dict, Tuple, Optional
+import sys
+from typing import List, Dict
 from pathlib import Path
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
@@ -25,6 +19,10 @@ from queue import Queue
 from threading import Thread
 import warnings
 warnings.filterwarnings('ignore')
+
+# Add parent directory to path for config import
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from config_loader import load_config, PipelineConfig
 
 try:
     import cupy as cp
@@ -42,22 +40,6 @@ except ImportError:
     print("ERROR: Ultralytics required")
 
 
-@dataclass
-class PipelineConfig:
-    """Configuration for the unified pipeline"""
-    batch_size: int = 32
-    num_features: int = 3072
-    yolo_model: str = 'yolo11m.pt'
-    yolo_conf_threshold: float = 0.1
-    mask_type: str = 'solid_color'
-    mask_color: Tuple[int, int, int] = (0, 0, 0)
-    use_half_precision: bool = True
-    max_gpu_memory_gb: float = 8.0
-    device: str = 'cuda:0'
-    num_workers: int = 2
-    prefetch_batches: int = 2  # Number of batches to prefetch
-
-
 class OptimizedGPU_Convert:
     """Optimized GPU converter with direct dicemap assembly"""
     def __init__(self, image_shape, device='cuda:0'):
@@ -70,9 +52,7 @@ class OptimizedGPU_Convert:
         self.device = device
         
         with cp.cuda.Device(int(device.split(':')[-1])):
-            # Pre-compute all coordinate mappings
             self.coors_xy = self._precompute_coordinates()
-            # Pre-allocate dicemap indices for fast assembly
             self._precompute_dicemap_indices()
         
         print(f"OptimizedGPU_Convert initialized for {h}x{w}")
@@ -80,21 +60,17 @@ class OptimizedGPU_Convert:
     def _precompute_coordinates(self):
         """Pre-compute all coordinate mappings"""
         face_w = self.face_size
-        
-        # Create coordinate grid for entire cube strip
         out = cp.zeros((face_w, face_w * 6, 3), dtype=cp.float32)
         rng = cp.linspace(-0.5, 0.5, num=face_w, dtype=cp.float32)
         x_grid, y_grid = cp.meshgrid(rng, rng, indexing='xy')
         
-        # Vectorized face assignments
         faces_data = [
-            # (start_col, x, y, z)
-            (0, x_grid, -y_grid, 0.5),      # Front
-            (1, 0.5, -y_grid, -x_grid),     # Right
-            (2, -x_grid, -y_grid, -0.5),    # Back
-            (3, -0.5, -y_grid, x_grid),     # Left
-            (4, x_grid, 0.5, y_grid),       # Up
-            (5, x_grid, -0.5, -y_grid),     # Down
+            (0, x_grid, -y_grid, 0.5),
+            (1, 0.5, -y_grid, -x_grid),
+            (2, -x_grid, -y_grid, -0.5),
+            (3, -0.5, -y_grid, x_grid),
+            (4, x_grid, 0.5, y_grid),
+            (5, x_grid, -0.5, -y_grid),
         ]
         
         for col, x, y, z in faces_data:
@@ -104,12 +80,10 @@ class OptimizedGPU_Convert:
             out[:, start:end, 1] = y
             out[:, start:end, 2] = z
         
-        # Convert to UV coordinates
         uv = self._xyz2uv(out)
         return self._uv2coor(uv, self.h, self.w)
     
     def _xyz2uv(self, xyz):
-        """Vectorized XYZ to UV conversion"""
         x, y, z = cp.split(xyz, 3, axis=-1)
         norm = cp.maximum(cp.sqrt(x**2 + y**2 + z**2), 1e-9)
         u = cp.arctan2(x, z)
@@ -117,18 +91,15 @@ class OptimizedGPU_Convert:
         return cp.concatenate([u, v], axis=-1)
     
     def _uv2coor(self, uv, h, w):
-        """Vectorized UV to pixel coordinates"""
         u, v = cp.split(uv, 2, axis=-1)
         coor_x = (u / (2 * cp.pi) + 0.5) * w - 0.5
         coor_y = (-v / cp.pi + 0.5) * h - 0.5
         return cp.concatenate([coor_x, coor_y], axis=-1).astype(cp.float32)
     
     def _precompute_dicemap_indices(self):
-        """Pre-compute dicemap layout indices for fast assembly"""
         fs = self.face_size
         self.dicemap_shape = (fs * 3, fs * 4)
         
-        # Store slices for each face in dicemap layout
         self.face_slices = {
             'U': (slice(0, fs), slice(fs, 2*fs)),
             'L': (slice(fs, 2*fs), slice(0, fs)),
@@ -137,7 +108,6 @@ class OptimizedGPU_Convert:
             'B': (slice(fs, 2*fs), slice(3*fs, 4*fs)),
         }
         
-        # Pre-compute cube strip indices
         self.cube_slices = {
             'F': slice(0, fs),
             'R': slice(fs, 2*fs),
@@ -148,21 +118,15 @@ class OptimizedGPU_Convert:
         }
     
     def _sample_equirec_batch(self, e_imgs, coor_xy):
-        """Optimized batch sampling with reduced memory operations"""
         batch_size, H, W, C = e_imgs.shape
-        
-        # Pad batch efficiently
         e_pad = cp.pad(e_imgs, ((0, 0), (1, 1), (0, 0), (0, 0)), mode="edge")
         
-        # Extract coordinates (these are 2D: height x width x 2)
         coor_x, coor_y = cp.split(coor_xy, 2, axis=-1)
         coor_y = coor_y + 1.0
         
-        # Prepare coordinates for map_coordinates
-        coords_shape = coor_x.shape[:-1]  # (height, width)
+        coords_shape = coor_x.shape[:-1]
         coords = cp.concatenate([coor_y, coor_x], axis=-1).reshape(-1, 2).T.astype(cp.float32)
         
-        # Process each image in batch
         results = []
         for b in range(batch_size):
             channel_results = []
@@ -178,22 +142,17 @@ class OptimizedGPU_Convert:
         return cp.stack(results, axis=0)
     
     def convert_batch_to_dicemaps(self, equirect_batch):
-        """Optimized batch conversion with direct dicemap assembly"""
         if isinstance(equirect_batch, np.ndarray):
             equirect_batch = cp.asarray(equirect_batch)
         
         batch_size = equirect_batch.shape[0]
-        
-        # Single batch sampling operation
         cubemaps = self._sample_equirec_batch(equirect_batch, self.coors_xy)
         
-        # Direct dicemap assembly on GPU
         dicemap_h, dicemap_w = self.dicemap_shape
         C = equirect_batch.shape[3]
         dicemaps = cp.zeros((batch_size, dicemap_h, dicemap_w, C), 
                            dtype=equirect_batch.dtype)
         
-        # Split cubemap strip into faces
         fs = self.face_size
         faces = {
             'F': cubemaps[:, :, 0:fs, :],
@@ -203,7 +162,6 @@ class OptimizedGPU_Convert:
             'U': cubemaps[:, :, 4*fs:5*fs, :],
         }
         
-        # Vectorized assignment to dicemap layout
         for face_name, (row_slice, col_slice) in self.face_slices.items():
             dicemaps[:, row_slice, col_slice, :] = faces[face_name]
         
@@ -222,47 +180,41 @@ class VectorizedCoordConverter:
             self._precompute_conversion_maps()
     
     def _precompute_conversion_maps(self):
-        """Pre-compute face region masks and conversion constants"""
         fs = self.face_size
-        
-        # Face regions in dicemap: (y_min, y_max, x_min, x_max, face_id)
         self.face_regions = cp.array([
-            [0, fs, fs, 2*fs, 0],      # U
-            [fs, 2*fs, 0, fs, 1],      # L
-            [fs, 2*fs, fs, 2*fs, 2],   # F
-            [fs, 2*fs, 2*fs, 3*fs, 3], # R
-            [fs, 2*fs, 3*fs, 4*fs, 4], # B
+            [0, fs, fs, 2*fs, 0],
+            [fs, 2*fs, 0, fs, 1],
+            [fs, 2*fs, fs, 2*fs, 2],
+            [fs, 2*fs, 2*fs, 3*fs, 3],
+            [fs, 2*fs, 3*fs, 4*fs, 4],
         ], dtype=cp.int32)
         
         self.face_names = ['U', 'L', 'F', 'R', 'B']
     
     def _face_to_xyz(self, face_id, x_face, y_face):
-        """Convert face coordinates to XYZ for a specific face"""
         fs = self.face_size
         u = (x_face / fs) - 0.5
         v = (y_face / fs) - 0.5
         
-        # Initialize output
         xyz = cp.zeros((*u.shape, 3), dtype=cp.float32)
         
-        # Direct assignment based on face_id (no masks needed)
-        if face_id == 0:  # U (Up)
+        if face_id == 0:
             xyz[:, 0] = u
             xyz[:, 1] = 0.5
             xyz[:, 2] = v
-        elif face_id == 1:  # L (Left)
+        elif face_id == 1:
             xyz[:, 0] = -0.5
             xyz[:, 1] = -v
             xyz[:, 2] = u
-        elif face_id == 2:  # F (Front)
+        elif face_id == 2:
             xyz[:, 0] = u
             xyz[:, 1] = -v
             xyz[:, 2] = 0.5
-        elif face_id == 3:  # R (Right)
+        elif face_id == 3:
             xyz[:, 0] = 0.5
             xyz[:, 1] = -v
             xyz[:, 2] = -u
-        elif face_id == 4:  # B (Back)
+        elif face_id == 4:
             xyz[:, 0] = -u
             xyz[:, 1] = -v
             xyz[:, 2] = -0.5
@@ -270,17 +222,14 @@ class VectorizedCoordConverter:
         return xyz
     
     def convert_batch(self, keypoints_batch_gpu):
-        """Vectorized batch coordinate conversion on GPU"""
         batch_size, num_points, _ = keypoints_batch_gpu.shape
         
         x_dice = keypoints_batch_gpu[:, :, 0]
         y_dice = keypoints_batch_gpu[:, :, 1]
         
-        # Initialize outputs
         eq_coords = cp.zeros_like(keypoints_batch_gpu)
         spherical_coords = cp.zeros_like(keypoints_batch_gpu)
         
-        # Determine which face each point belongs to
         for i, (y_min, y_max, x_min, x_max, face_id) in enumerate(self.face_regions):
             mask = ((x_dice >= x_min) & (x_dice < x_max) & 
                    (y_dice >= y_min) & (y_dice < y_max))
@@ -288,14 +237,11 @@ class VectorizedCoordConverter:
             if not cp.any(mask):
                 continue
             
-            # Convert to face coordinates
             x_face = cp.clip(x_dice - x_min, 0, self.face_size - 1)
             y_face = cp.clip(y_dice - y_min, 0, self.face_size - 1)
             
-            # Convert face coords to XYZ for masked points only
             xyz = self._face_to_xyz(face_id, x_face[mask], y_face[mask])
             
-            # Convert XYZ to spherical
             x, y, z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
             norm = cp.sqrt(x**2 + y**2 + z**2)
             norm = cp.maximum(norm, 1e-9)
@@ -303,7 +249,6 @@ class VectorizedCoordConverter:
             lon = cp.arctan2(x, z)
             lat = cp.arcsin(y / norm)
             
-            # Convert to equirectangular pixel coordinates
             u = (lon / (2 * cp.pi) + 0.5) * self.eq_width
             v = (-lat / cp.pi + 0.5) * self.eq_height
             
@@ -316,7 +261,7 @@ class VectorizedCoordConverter:
 
 
 class UnifiedGPUPipeline:
-    """Optimized unified pipeline with reduced CPU-GPU transfers"""
+    """Optimized unified pipeline with config-based settings"""
     
     def __init__(self, config: PipelineConfig):
         self.config = config
@@ -324,54 +269,51 @@ class UnifiedGPUPipeline:
         if not CUPY_AVAILABLE or not ULTRALYTICS_AVAILABLE:
             raise RuntimeError("CuPy and Ultralytics required")
         
-        self.device_id = int(config.device.split(':')[-1])
+        self.device_id = int(config.gpu.device.split(':')[-1])
         self._setup_memory_pool()
         
-        # Caches
         self.converter_cache = {}
         self.coord_converter_cache = {}
-        
-        # Pre-allocate reusable GPU buffers
         self.gpu_buffer_pool = {}
         
         self._initialize_models()
         
-        # Prefetch queue
-        self.prefetch_queue = Queue(maxsize=config.prefetch_batches)
+        self.prefetch_queue = Queue(maxsize=config.batching.prefetch_batches)
         self.prefetch_thread = None
         
-        print(f"Pipeline initialized with {config.num_workers} workers")
+        print(f"Pipeline initialized with {config.batching.num_workers} workers")
     
     def _setup_memory_pool(self):
-        """Setup optimized memory pool"""
-        pool_size = int(self.config.max_gpu_memory_gb * 1024**3)
+        pool_size = int(self.config.gpu.max_memory_gb * 1024**3)
         self.memory_pool = cp.get_default_memory_pool()
         self.pinned_memory_pool = cp.get_default_pinned_memory_pool()
         self.memory_pool.set_limit(pool_size)
-        print(f"GPU memory pool: {self.config.max_gpu_memory_gb}GB")
+        print(f"GPU memory pool: {self.config.gpu.max_memory_gb}GB")
     
     def _initialize_models(self):
-        """Initialize models with optimizations"""
         print("\nInitializing models...")
         
         # YOLO
-        self.yolo_model = YOLO(self.config.yolo_model)
-        self.yolo_model.to(self.config.device)
+        self.yolo_model = YOLO(self.config.models.yolo_model)
+        self.yolo_model.to(self.config.gpu.device)
         
         # XFeat
-        import sys
-        sys.path.append("/data/sahil/new_colmap/Xfeat")
+        sys.path.append(self.config.models.xfeat_module_path)
         from modules.xfeat import XFeat
-        self.xfeat_model = XFeat().eval().cuda()
-        
-        if self.config.use_half_precision:
+        self.xfeat_model = XFeat(
+            weights=self.config.models.xfeat_weights,
+            top_k=self.config.features.num_features,
+            detection_threshold=self.config.features.detection_threshold,
+            lightglue_checkpoint=self.config.models.lightglue_checkpoint  # ADD THIS
+        ).eval().cuda()
+                
+        if self.config.gpu.use_half_precision:
             self.xfeat_model = self.xfeat_model.half()
         
-        # Optimizations
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
         
-        if hasattr(torch, 'compile'):
+        if self.config.gpu.compile_models and hasattr(torch, 'compile'):
             try:
                 self.xfeat_model = torch.compile(
                     self.xfeat_model, mode='max-autotune'
@@ -382,7 +324,6 @@ class UnifiedGPUPipeline:
         print("Models initialized\n")
     
     def _get_converter(self, h, w):
-        """Get or create cached converter"""
         key = (h, w)
         if key not in self.converter_cache:
             if len(self.converter_cache) >= 5:
@@ -390,43 +331,37 @@ class UnifiedGPUPipeline:
             
             with cp.cuda.Device(self.device_id):
                 self.converter_cache[key] = OptimizedGPU_Convert(
-                    (h, w, 3), self.config.device
+                    (h, w, 3), self.config.gpu.device
                 )
         return self.converter_cache[key]
     
     def _get_coord_converter(self, face_size, eq_width, eq_height):
-        """Get or create cached coordinate converter"""
         key = (face_size, eq_width, eq_height)
         if key not in self.coord_converter_cache:
             with cp.cuda.Device(self.device_id):
                 self.coord_converter_cache[key] = VectorizedCoordConverter(
-                    face_size, eq_width, eq_height, self.config.device
+                    face_size, eq_width, eq_height, self.config.gpu.device
                 )
         return self.coord_converter_cache[key]
     
     def _detect_and_mask_batch(self, dicemap_gpu):
-        """Combined detection and masking in single pass"""
         B = dicemap_gpu.shape[0]
-        
-        # Direct BGR conversion on GPU
         dicemap_bgr = dicemap_gpu[..., [2, 1, 0]]
         
         with cp.cuda.Device(self.device_id):
-            # Zero-copy tensor creation
             images_tensor = torch.as_tensor(
-                dicemap_bgr, device=self.config.device
+                dicemap_bgr, device=self.config.gpu.device
             ).permute(0, 3, 1, 2).float() / 255.0
         
-        # YOLO detection
         with torch.no_grad():
             results = self.yolo_model.predict(
                 images_tensor,
-                conf=self.config.yolo_conf_threshold,
+                conf=self.config.human_detection.confidence_threshold,
                 classes=[0],
-                device=self.config.device,
+                device=self.config.gpu.device,
                 verbose=False,
                 stream=True,
-                half=self.config.use_half_precision
+                half=self.config.gpu.use_half_precision
             )
             
             detections = []
@@ -438,9 +373,9 @@ class UnifiedGPUPipeline:
                             for x1, y1, x2, y2 in xyxy]
                 detections.append(boxes)
         
-        # Vectorized masking on GPU
-        if self.config.mask_type == 'solid_color':
-            mask_color = cp.array(self.config.mask_color, dtype=dicemap_gpu.dtype)
+        if self.config.human_detection.mask_type == 'solid_color':
+            mask_color = cp.array(self.config.human_detection.mask_color, 
+                                 dtype=dicemap_gpu.dtype)
             for i, boxes in enumerate(detections):
                 for x, y, w, h in boxes:
                     dicemap_gpu[i, y:y+h, x:x+w, :] = mask_color
@@ -449,25 +384,23 @@ class UnifiedGPUPipeline:
         return dicemap_gpu, detections
     
     def _extract_features_optimized(self, images_gpu):
-        """Optimized feature extraction with larger batches"""
         with cp.cuda.Device(self.device_id):
             images_tensor = torch.as_tensor(
-                images_gpu, device=self.config.device
+                images_gpu, device=self.config.gpu.device
             ).permute(0, 3, 1, 2).float() / 255.0
             
-            if self.config.use_half_precision:
+            if self.config.gpu.use_half_precision:
                 images_tensor = images_tensor.half()
         
-        # Use larger sub-batches for better GPU utilization
-        sub_batch_size = min(self.config.batch_size, 32)
+        sub_batch_size = min(self.config.batching.feature_batch_size, 32)
         all_results = []
         
-        with torch.cuda.amp.autocast(enabled=self.config.use_half_precision):
+        with torch.cuda.amp.autocast(enabled=self.config.gpu.use_half_precision):
             with torch.no_grad():
                 for i in range(0, len(images_tensor), sub_batch_size):
                     batch = images_tensor[i:i+sub_batch_size]
                     outputs = self.xfeat_model.detectAndCompute(
-                        batch, top_k=self.config.num_features
+                        batch, top_k=self.config.features.num_features
                     )
                     
                     for output in outputs:
@@ -476,10 +409,9 @@ class UnifiedGPUPipeline:
                             desc = output.get('descriptors', torch.zeros((0, 64)))
                             scores = output.get('scores', torch.zeros((0,)))
                             
-                            # Keep on GPU as long as possible
                             n = len(kpts)
-                            if n < self.config.num_features:
-                                pad = self.config.num_features - n
+                            if n < self.config.features.num_features:
+                                pad = self.config.features.num_features - n
                                 kpts = torch.cat([kpts, torch.zeros((pad, 2), device=kpts.device)])
                                 desc = torch.cat([desc, torch.zeros((pad, 64), device=desc.device)])
                                 scores = torch.cat([scores, torch.zeros(pad, device=scores.device)])
@@ -490,18 +422,19 @@ class UnifiedGPUPipeline:
                                 'scores': scores
                             })
                         else:
-                            # Pad with zeros
                             all_results.append({
-                                'keypoints': torch.zeros((self.config.num_features, 2), device=self.config.device),
-                                'descriptors': torch.zeros((self.config.num_features, 64), device=self.config.device),
-                                'scores': torch.zeros(self.config.num_features, device=self.config.device)
+                                'keypoints': torch.zeros((self.config.features.num_features, 2), 
+                                                        device=self.config.gpu.device),
+                                'descriptors': torch.zeros((self.config.features.num_features, 64), 
+                                                          device=self.config.gpu.device),
+                                'scores': torch.zeros(self.config.features.num_features, 
+                                                     device=self.config.gpu.device)
                             })
         
         del images_tensor
         return all_results
     
     def process_batch(self, image_paths: List[str], image_batch: np.ndarray) -> Dict:
-        """Optimized batch processing with minimal CPU-GPU transfers"""
         B, h, w = len(image_batch), image_batch[0].shape[0], image_batch[0].shape[1]
         face_size = h // 2
         
@@ -509,31 +442,25 @@ class UnifiedGPUPipeline:
         start = time.time()
         
         with cp.cuda.Device(self.device_id):
-            # Step 1: Convert to dicemaps (stays on GPU)
             t1 = time.time()
             converter = self._get_converter(h, w)
             dicemap_gpu = converter.convert_batch_to_dicemaps(image_batch)
             print(f"    Dicemap: {time.time()-t1:.2f}s")
             
-            # Step 2: Detect and mask (all on GPU)
             t2 = time.time()
             masked_gpu, detections = self._detect_and_mask_batch(dicemap_gpu)
             print(f"    Detect+Mask: {time.time()-t2:.2f}s")
             
-            # Step 3: Extract features (stays on GPU)
             t3 = time.time()
             feature_results = self._extract_features_optimized(masked_gpu)
             print(f"    Features: {time.time()-t3:.2f}s")
             
-            # Step 4: Vectorized coordinate conversion on GPU
             t4 = time.time()
             coord_converter = self._get_coord_converter(face_size, w, h)
             
-            # Convert features to CuPy arrays (stay on GPU)
             keypoints_list = []
             for f in feature_results:
                 if isinstance(f['keypoints'], torch.Tensor):
-                    # Transfer from PyTorch to CuPy directly
                     kpts_cp = cp.asarray(f['keypoints'].detach())
                 else:
                     kpts_cp = cp.asarray(f['keypoints'])
@@ -544,12 +471,10 @@ class UnifiedGPUPipeline:
             eq_coords_gpu, sph_coords_gpu = coord_converter.convert_batch(keypoints_gpu)
             print(f"    Coords: {time.time()-t4:.2f}s")
             
-            # Single batched transfer to CPU at the end
             t5 = time.time()
             eq_coords = cp.asnumpy(eq_coords_gpu)
             sph_coords = cp.asnumpy(sph_coords_gpu)
             
-            # Transfer features to CPU in batch
             keypoints_np = cp.asnumpy(keypoints_gpu)
             descriptors_np = np.stack([
                 f['descriptors'].cpu().numpy() if isinstance(f['descriptors'], torch.Tensor) 
@@ -564,7 +489,6 @@ class UnifiedGPUPipeline:
         total_humans = sum(len(d) for d in detections)
         print(f"    Total: {time.time()-start:.2f}s | Humans: {total_humans}")
         
-        # Assemble results
         results = {}
         for i, path in enumerate(image_paths):
             name = os.path.basename(path)
@@ -578,7 +502,6 @@ class UnifiedGPUPipeline:
                 'humans_detected': len(detections[i])
             }
         
-        # Cleanup
         del dicemap_gpu, masked_gpu, keypoints_gpu, eq_coords_gpu, sph_coords_gpu
         del feature_results, keypoints_list, keypoints_np, descriptors_np, scores_np
         torch.cuda.empty_cache()
@@ -588,7 +511,6 @@ class UnifiedGPUPipeline:
         return results
     
     def _write_batch_to_hdf5(self, output_file: str, batch_results: Dict, mode='w'):
-        """Optimized HDF5 writing"""
         with h5py.File(output_file, mode) as f:
             for name, data in batch_results.items():
                 if name in f:
@@ -599,27 +521,25 @@ class UnifiedGPUPipeline:
                     if key != 'humans_detected':
                         grp.create_dataset(
                             key, data=value,
-                            compression='gzip', compression_opts=4,
-                            shuffle=True  # Better compression
+                            compression='gzip', 
+                            compression_opts=self.config.io.compression_level,
+                            shuffle=True
                         )
                 grp.attrs['humans_detected'] = data['humans_detected']
     
     def _prefetch_worker(self, batches):
-        """Background thread for prefetching image batches"""
         for batch_paths, batch_data in batches:
             self.prefetch_queue.put((batch_paths, batch_data))
-        self.prefetch_queue.put(None)  # Sentinel
+        self.prefetch_queue.put(None)
     
     def process_images(self, image_paths: List[str], output_file: str):
-        """Process all images with prefetching"""
         print(f"\n=== Processing {len(image_paths)} images ===")
-        print(f"Batch size: {self.config.batch_size} | "
-              f"Features: {self.config.num_features} | "
-              f"Workers: {self.config.num_workers}")
+        print(f"Batch size: {self.config.batching.feature_batch_size} | "
+              f"Features: {self.config.features.num_features} | "
+              f"Workers: {self.config.batching.num_workers}")
         
-        # Load and group images by size
         print("\nLoading images...")
-        with ThreadPoolExecutor(max_workers=self.config.num_workers) as executor:
+        with ThreadPoolExecutor(max_workers=self.config.batching.num_workers) as executor:
             loaded = list(executor.map(
                 lambda p: (p, cv2.cvtColor(cv2.imread(p), cv2.COLOR_BGR2RGB))
                 if cv2.imread(p) is not None else None,
@@ -632,21 +552,18 @@ class UnifiedGPUPipeline:
             shape = img.shape[:2]
             size_groups.setdefault(shape, []).append((path, img))
         
-        # Prepare all batches
         all_batches = []
         for shape, group_data in size_groups.items():
-            for i in range(0, len(group_data), self.config.batch_size):
-                batch_data = group_data[i:i+self.config.batch_size]
+            for i in range(0, len(group_data), self.config.batching.feature_batch_size):
+                batch_data = group_data[i:i+self.config.batching.feature_batch_size]
                 paths, imgs = zip(*batch_data)
                 all_batches.append((list(paths), np.array(imgs)))
         
-        # Start prefetch thread
         self.prefetch_thread = Thread(
             target=self._prefetch_worker, args=(all_batches,)
         )
         self.prefetch_thread.start()
         
-        # Process batches
         total_results = 0
         total_humans = 0
         first_batch = True
@@ -659,7 +576,6 @@ class UnifiedGPUPipeline:
             batch_paths, batch_images = batch_item
             batch_results = self.process_batch(batch_paths, batch_images)
             
-            # Write immediately
             mode = 'w' if first_batch else 'a'
             self._write_batch_to_hdf5(output_file, batch_results, mode)
             first_batch = False
@@ -677,7 +593,6 @@ class UnifiedGPUPipeline:
         self._cleanup()
     
     def _cleanup(self):
-        """Cleanup resources"""
         torch.cuda.empty_cache()
         self.memory_pool.free_all_blocks()
         self.pinned_memory_pool.free_all_blocks()
@@ -685,7 +600,6 @@ class UnifiedGPUPipeline:
 
 
 def find_images(directory: str) -> List[str]:
-    """Find all image files"""
     exts = ['.jpg', '.jpeg', '.png', '.tiff', '.tif', '.bmp', '.webp']
     images = []
     path = Path(directory)
@@ -697,20 +611,23 @@ def find_images(directory: str) -> List[str]:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Optimized GPU pipeline for panoramic image processing"
+        description="Optimized GPU pipeline with config-based hyperparameters"
     )
     parser.add_argument('--image_dir', type=str, required=True)
     parser.add_argument('--output_file', type=str, default="features.h5")
-    parser.add_argument('--batch_size', type=int, default=128)
-    parser.add_argument('--num_features', type=int, default=3072)
-    parser.add_argument('--yolo_model', type=str, default='yolo11n.pt')
-    parser.add_argument('--yolo_conf', type=float, default=0.1)
-    parser.add_argument('--mask_type'   , type=str, default='solid_color')
-    parser.add_argument('--mask_color', type=int, nargs=3, default=[0, 0, 0])
-    parser.add_argument('--gpu_memory', type=float, default=20.0)
+    parser.add_argument('--config', type=str, default="config.yaml",
+                       help="Path to configuration file")
+    
+    # Optional overrides
+    parser.add_argument('--batch_size', type=int)
+    parser.add_argument('--num_features', type=int)
+    parser.add_argument('--yolo_model', type=str)
+    parser.add_argument('--yolo_conf', type=float)
+    parser.add_argument('--mask_type', type=str)
+    parser.add_argument('--mask_color', type=int, nargs=3)
+    parser.add_argument('--gpu_memory', type=float)
     parser.add_argument('--no_half_precision', action='store_true')
-    parser.add_argument('--num_workers', type=int, default=8)
-    parser.add_argument('--prefetch_batches', type=int, default=2)
+    parser.add_argument('--num_workers', type=int)
     
     args = parser.parse_args()
     
@@ -718,23 +635,13 @@ def main():
         print("ERROR: CuPy and Ultralytics required")
         return
     
+    # Load config with CLI overrides
+    config = load_config(args.config, args)
+    
     image_paths = find_images(args.image_dir)
     if not image_paths:
         print(f"No images found in {args.image_dir}")
         return
-    
-    config = PipelineConfig(
-        batch_size=args.batch_size,
-        num_features=args.num_features,
-        yolo_model=args.yolo_model,
-        yolo_conf_threshold=args.yolo_conf,
-        mask_type=args.mask_type,
-        mask_color=tuple(args.mask_color),
-        use_half_precision=not args.no_half_precision,
-        max_gpu_memory_gb=args.gpu_memory,
-        num_workers=args.num_workers,
-        prefetch_batches=args.prefetch_batches
-    )
     
     pipeline = UnifiedGPUPipeline(config)
     pipeline.process_images(image_paths, args.output_file)

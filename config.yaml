@@ -1,0 +1,70 @@
+# COLMAP Pipeline Configuration
+# All hyperparameters in one place
+
+# === Model Paths ===
+models:
+  xfeat_weights: "/data/sahil/new_colmap/Xfeat/weights/xfeat_perm_steer.pth"
+  yolo_model: "yolo11s.pt"
+  lightglue_checkpoint: "/data/sahil/new_colmap/Hierarchical-Localization/spherecraft_pretrain_lightglue_run3/checkpoint_best.tar"
+  xfeat_module_path: "/data/sahil/new_colmap/Xfeat"
+
+# === Feature Extraction ===
+features:
+  num_features: 3072        # Features per dicemap
+  max_keypoints: 3072       # Max keypoints for matching
+  detection_threshold: 0.05 # XFeat detection threshold
+
+# === Human Detection & Masking ===
+human_detection:
+  enabled: true
+  confidence_threshold: 0.1
+  mask_type: "solid_color"  # Options: solid_color, blur, pixelate
+  mask_color: [0, 0, 0]     # RGB values
+
+# === Image Pairing ===
+pairing:
+  num_matches: 6            # Number of sequential matches per image
+
+# === Feature Matching ===
+matching:
+  min_confidence: 0.1       # LightGlue minimum confidence
+  min_cossim: 0.82          # XFeat cosine similarity threshold
+  use_spherical_coords: true
+
+# === COLMAP Mapper Settings ===
+colmap:
+  mapper:
+    ba_gpu_index: 0
+    ba_use_gpu: 1
+    ba_refine_focal_length: 0
+    ba_refine_extra_params: 0
+    abs_pose_max_error: 1.0
+    max_reg_trials: 6
+    tri_min_angle: 4.0
+  camera:
+    model_id: 12            # Camera model (12 = Simple Radial Fisheye)
+    focal_multiplier: 1.2   # Multiplier for focal length estimation
+
+# === GPU & Performance ===
+gpu:
+  device: "cuda:0"
+  max_memory_gb: 20.0
+  use_half_precision: true
+  compile_models: false     # PyTorch compilation (experimental)
+
+# === Batch Processing ===
+batching:
+  feature_batch_size: 32    # Batch size for feature extraction
+  matching_batch_size: 64   # Batch size for matching
+  num_workers: 8            # DataLoader workers
+  prefetch_batches: 2       # Number of batches to prefetch
+
+# === I/O Settings ===
+io:
+  keep_intermediate: false  # Keep dicemaps and detection results
+  compression_level: 4      # HDF5 compression (0-9)
+
+# === Logging ===
+logging:
+  verbose: true
+  progress_bars: true

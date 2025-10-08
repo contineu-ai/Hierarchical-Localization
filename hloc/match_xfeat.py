@@ -1,16 +1,25 @@
+"""
+Refactored XFeat Matching - Uses Centralized Config
+"""
+
 import torch
 import torch.nn.functional as F
 import numpy as np
 import h5py
+import argparse
+import sys
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List
 import gc
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-# Try to import CuPy for GPU acceleration
+# Add parent directory for config import
+
+from hloc.config_loader import load_config, PipelineConfig
+
 try:
     import cupy as cp
     CUPY_AVAILABLE = True
@@ -20,24 +29,20 @@ except ImportError:
 
 
 class OptimizedBatchDataset(Dataset):
-    """Optimized dataset with better memory management and minimal copying"""
+    """Optimized dataset with config-based settings"""
     
-    def __init__(self, pairs, feature_path_q, feature_path_r, max_keypoints=4096):
+    def __init__(self, pairs, feature_path_q, feature_path_r, config: PipelineConfig):
         self.pairs = pairs
         self.feature_paths = {'query': feature_path_q, 'ref': feature_path_r}
-        self.max_keypoints = max_keypoints
-        
-        # File handles (opened once per worker, thread-safe with SWMR)
+        self.max_keypoints = config.features.max_keypoints
         self._handles = {}
         
     def _get_handle(self, key):
-        """Get or create file handle for worker"""
         if key not in self._handles:
             self._handles[key] = h5py.File(self.feature_paths[key], 'r', swmr=True)
         return self._handles[key]
     
     def _load_features(self, name: str, source: str) -> Dict:
-        """Load features efficiently without unnecessary copies"""
         handle = self._get_handle(source)
         if name not in handle:
             return self._empty_features()
@@ -45,11 +50,9 @@ class OptimizedBatchDataset(Dataset):
         grp = handle[name]
         features = {}
         
-        # Load data as tensors directly, limit keypoints
         for key in ['spherical_keypoints', 'keypoints', 'descriptors', 'scores', 'image_size']:
             if key in grp:
-                data = grp[key][...]  # Load directly as numpy array
-                # Limit keypoints if needed
+                data = grp[key][...]
                 if key in ['spherical_keypoints', 'keypoints', 'descriptors', 'scores']:
                     data = data[:self.max_keypoints]
                 features[key] = torch.from_numpy(data).float()
@@ -57,7 +60,6 @@ class OptimizedBatchDataset(Dataset):
         return features
     
     def _empty_features(self) -> Dict:
-        """Return empty feature dictionary"""
         return {
             'spherical_keypoints': torch.zeros((0, 2), dtype=torch.float32),
             'keypoints': torch.zeros((0, 2), dtype=torch.float32),
@@ -69,7 +71,6 @@ class OptimizedBatchDataset(Dataset):
     def __getitem__(self, idx):
         name0, name1 = self.pairs[idx]
         
-        # Load features without caching (let OS handle file caching)
         features0 = self._load_features(name0, 'query')
         features1 = self._load_features(name1, 'ref')
         
@@ -100,7 +101,6 @@ class OptimizedBatchDataset(Dataset):
 
 def collate_fn(batch):
     """Efficient collate function that preserves tensor structure"""
-    # Stack tensors where possible, keep variable-length as lists
     return {
         'pair_names': [item['pair_names'] for item in batch],
         'spherical_kpts0': [item['spherical_kpts0'] for item in batch],
@@ -117,25 +117,23 @@ def collate_fn(batch):
 
 
 class OptimizedXFeatMatcher:
-    """Optimized XFeat matcher with true batch processing"""
+    """Optimized XFeat matcher with config-based settings"""
     
-    def __init__(self, xfeat_model, device='cuda', use_fp16=True, compile_model=False):
-        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+    def __init__(self, xfeat_model, config: PipelineConfig):
+        self.config = config
+        self.device = torch.device(config.gpu.device if torch.cuda.is_available() else 'cpu')
         self.xfeat = xfeat_model.to(self.device)
         self.xfeat.eval()
         
-        # Enable optimizations
-        self.use_fp16 = use_fp16 and self.device.type == 'cuda'
+        self.use_fp16 = config.gpu.use_half_precision and self.device.type == 'cuda'
         
-        # Note: torch.compile often causes issues with dynamic shapes, disabled by default
-        if compile_model and hasattr(torch, 'compile'):
+        if config.gpu.compile_models and hasattr(torch, 'compile'):
             try:
                 self.xfeat = torch.compile(self.xfeat, mode='reduce-overhead')
                 print("XFeat model compiled")
             except Exception as e:
                 print(f"Model compilation failed: {e}")
         
-        # Enable CUDA optimizations
         if self.device.type == 'cuda':
             torch.backends.cudnn.benchmark = True
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -146,19 +144,15 @@ class OptimizedXFeatMatcher:
         
         batch_size = len(batch_data['pair_names'])
         
-        # Prepare XFeat inputs efficiently
         outputs0 = []
         outputs1 = []
         
-        # Convert to proper dtype and move to GPU in one go
         dtype = torch.float16 if self.use_fp16 else torch.float32
         
         for i in range(batch_size):
-            # Use spherical_keypoints as the primary keypoints for matching
             kpts0 = batch_data['spherical_kpts0'][i]
             kpts1 = batch_data['spherical_kpts1'][i]
             
-            # Skip pairs with no keypoints
             if len(kpts0) == 0 or len(kpts1) == 0:
                 outputs0.append(None)
                 outputs1.append(None)
@@ -179,24 +173,21 @@ class OptimizedXFeatMatcher:
             outputs0.append(output0)
             outputs1.append(output1)
         
-        # Filter out None entries
         valid_indices = [i for i in range(batch_size) if outputs0[i] is not None]
         valid_outputs0 = [outputs0[i] for i in valid_indices]
         valid_outputs1 = [outputs1[i] for i in valid_indices]
         
-        # Batch matching with XFeat/LightGlue
         matches = []
         if len(valid_outputs0) > 0:
             try:
                 if hasattr(self.xfeat, 'batch_match_lighterglue'):
-                    # Use batched LightGlue matching - this is the key optimization
                     with torch.cuda.amp.autocast(enabled=self.use_fp16):
                         batch_matches = self.xfeat.batch_match_lighterglue(
-                            valid_outputs0, valid_outputs1, min_conf=0.2
+                            valid_outputs0, valid_outputs1, 
+                            min_conf=self.config.matching.min_confidence
                         )
                     matches = batch_matches
                 else:
-                    # Fallback to individual matching
                     for out0, out1 in zip(valid_outputs0, valid_outputs1):
                         with torch.cuda.amp.autocast(enabled=self.use_fp16):
                             match_result = self._match_single(out0, out1)
@@ -209,7 +200,6 @@ class OptimizedXFeatMatcher:
                            'idxs_0': np.array([]), 'idxs_1': np.array([])} 
                           for _ in range(len(valid_outputs0))]
         
-        # Build results for all pairs (including those skipped)
         results = []
         valid_match_idx = 0
         
@@ -218,26 +208,22 @@ class OptimizedXFeatMatcher:
             num_kpts0 = len(batch_data['keypoints0'][i])
             
             if outputs0[i] is None:
-                # Empty result for skipped pairs
                 results.append({
                     'pair_name': pair_name,
                     'matches0': torch.full((num_kpts0,), -1, dtype=torch.long),
                     'matching_scores0': torch.zeros(num_kpts0, dtype=torch.float32)
                 })
             else:
-                # Process valid match
                 match_result = matches[valid_match_idx] if valid_match_idx < len(matches) else None
                 valid_match_idx += 1
                 
                 if match_result and 'idxs_0' in match_result and len(match_result['idxs_0']) > 0:
-                    # Create match array
                     matches0 = torch.full((num_kpts0,), -1, dtype=torch.long)
                     scores0 = torch.zeros(num_kpts0, dtype=torch.float32)
                     
                     idxs_0 = match_result['idxs_0']
                     idxs_1 = match_result['idxs_1']
                     
-                    # Assign matches (indices from batch_match_lighterglue)
                     for idx0, idx1 in zip(idxs_0, idxs_1):
                         if 0 <= idx0 < num_kpts0:
                             matches0[idx0] = idx1
@@ -249,7 +235,6 @@ class OptimizedXFeatMatcher:
                         'matching_scores0': scores0
                     })
                 else:
-                    # Empty result
                     results.append({
                         'pair_name': pair_name,
                         'matches0': torch.full((num_kpts0,), -1, dtype=torch.long),
@@ -271,17 +256,13 @@ class OptimizedXFeatMatcher:
                 'idxs_1': np.array([])
             }
         
-        # Compute similarity matrix
         sim = torch.matmul(desc0, desc1.t())
         
-        # Mutual nearest neighbor
         nn01 = sim.argmax(dim=1)
         nn10 = sim.argmax(dim=0)
         
-        # Find mutual matches
         mutual = nn10[nn01] == torch.arange(len(nn01), device=sim.device)
         
-        # Get matched keypoints
         idx0 = torch.where(mutual)[0]
         idx1 = nn01[mutual]
         
@@ -297,22 +278,18 @@ class OptimizedXFeatMatcher:
 
 
 class OptimizedWriter:
-    """Optimized HDF5 writer with proper synchronization"""
+    """Optimized HDF5 writer with config-based compression"""
     
-    def __init__(self, output_path: Path):
+    def __init__(self, output_path: Path, config: PipelineConfig):
         self.output_path = output_path
-        self.buffer = []
-        # Create file initially
+        self.config = config
         with h5py.File(self.output_path, 'w') as f:
-            pass  # Just create empty file
+            pass
     
     def add_results(self, results: List[Dict]):
-        """Add results to buffer and write immediately"""
-        # Write immediately to avoid memory buildup
         self._write_batch(results)
     
     def _write_batch(self, batch: List[Dict]):
-        """Write a batch of results"""
         if not batch:
             return
             
@@ -321,25 +298,22 @@ class OptimizedWriter:
                 for result in batch:
                     pair_name = result['pair_name']
                     
-                    # Remove existing group if present
                     if pair_name in f:
                         del f[pair_name]
                     
-                    # Create new group
                     grp = f.create_group(pair_name)
                     
-                    # Write data with compression
                     grp.create_dataset(
                         'matches0',
                         data=result['matches0'].cpu().numpy().astype(np.int32),
                         compression='gzip',
-                        compression_opts=4  # Faster compression
+                        compression_opts=self.config.io.compression_level
                     )
                     grp.create_dataset(
                         'matching_scores0',
                         data=result['matching_scores0'].cpu().numpy().astype(np.float32),
                         compression='gzip',
-                        compression_opts=4
+                        compression_opts=self.config.io.compression_level
                     )
         except Exception as e:
             print(f"Write error: {e}")
@@ -347,8 +321,7 @@ class OptimizedWriter:
             traceback.print_exc()
     
     def close(self):
-        """Flush remaining data and close"""
-        pass  # Nothing to do since we write immediately
+        pass
 
 
 def optimized_match_from_paths(
@@ -356,21 +329,18 @@ def optimized_match_from_paths(
     feature_path_q: Path,
     feature_path_r: Path,
     output_path: Path,
-    batch_size: int = 32,
-    num_workers: int = 4,
-    max_keypoints: int = 4096,
-    use_fp16: bool = True,
-    compile_model: bool = False
+    config: PipelineConfig
 ) -> Path:
-    """Main optimized matching pipeline"""
+    """Main optimized matching pipeline with config"""
     
-    print(f"Optimized XFeat Matching Pipeline")
+    print(f"\nOptimized XFeat Matching Pipeline")
     print(f"Configuration:")
-    print(f"  Batch size: {batch_size}")
-    print(f"  Workers: {num_workers}")
-    print(f"  Max keypoints: {max_keypoints}")
-    print(f"  FP16: {use_fp16}")
-    print(f"  Model compilation: {compile_model}")
+    print(f"  Batch size: {config.batching.matching_batch_size}")
+    print(f"  Workers: {config.batching.num_workers}")
+    print(f"  Max keypoints: {config.features.max_keypoints}")
+    print(f"  FP16: {config.gpu.use_half_precision}")
+    print(f"  Min confidence: {config.matching.min_confidence}")
+    print(f"  Model compilation: {config.gpu.compile_models}")
     
     # Load pairs
     from hloc.utils.parsers import parse_retrieval
@@ -379,52 +349,43 @@ def optimized_match_from_paths(
     print(f"Processing {len(pairs)} pairs")
     
     # Initialize XFeat model
-    import sys
-    sys.path.append("/data/sahil/new_colmap/Xfeat")
+    sys.path.append(config.models.xfeat_module_path)
     from modules.xfeat import XFeat
-    xfeat_model = XFeat()
-    
+    xfeat_model = XFeat(
+        weights=config.models.xfeat_weights,
+        top_k=config.features.max_keypoints,
+        detection_threshold=config.features.detection_threshold,
+        lightglue_checkpoint=config.models.lightglue_checkpoint  # ADD THIS
+    )
     # Create dataset and dataloader
     dataset = OptimizedBatchDataset(
-        pairs, feature_path_q, feature_path_r,
-        max_keypoints=max_keypoints
+        pairs, feature_path_q, feature_path_r, config
     )
     
-    # Optimize dataloader settings
     dataloader = DataLoader(
         dataset,
-        batch_size=batch_size,
-        num_workers=num_workers,
+        batch_size=config.batching.matching_batch_size,
+        num_workers=config.batching.num_workers,
         pin_memory=True if torch.cuda.is_available() else False,
-        persistent_workers=True if num_workers > 0 else False,
-        prefetch_factor=2 if num_workers > 0 else None,
+        persistent_workers=True if config.batching.num_workers > 0 else False,
+        prefetch_factor=config.batching.prefetch_batches if config.batching.num_workers > 0 else None,
         drop_last=False,
         collate_fn=collate_fn
     )
     
     # Initialize matcher and writer
-    matcher = OptimizedXFeatMatcher(
-        xfeat_model,
-        device='cuda' if torch.cuda.is_available() else 'cpu',
-        use_fp16=use_fp16,
-        compile_model=compile_model
-    )
-    writer = OptimizedWriter(output_path)
+    matcher = OptimizedXFeatMatcher(xfeat_model, config)
+    writer = OptimizedWriter(output_path, config)
     
     # Process batches
     try:
-        with tqdm(total=len(pairs), desc="Matching") as pbar:
+        with tqdm(total=len(pairs), desc="Matching", 
+                 disable=not config.logging.progress_bars) as pbar:
             for batch_idx, batch_data in enumerate(dataloader):
-                # Process batch
                 results = matcher.match_batch(batch_data)
-                
-                # Write results immediately
                 writer.add_results(results)
-                
-                # Update progress
                 pbar.update(len(results))
                 
-                # Memory management every 50 batches
                 if batch_idx % 50 == 0 and torch.cuda.is_available():
                     torch.cuda.empty_cache()
     
@@ -435,7 +396,6 @@ def optimized_match_from_paths(
         import traceback
         traceback.print_exc()
     finally:
-        # Cleanup
         writer.close()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -445,22 +405,31 @@ def optimized_match_from_paths(
     return output_path
 
 
-# Example usage
 if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Optimized XFeat Matching")
+    parser = argparse.ArgumentParser(description="Optimized XFeat Matching with Config")
     parser.add_argument("--pairs", type=Path, required=True)
     parser.add_argument("--features", type=Path, required=True)
     parser.add_argument("--features_ref", type=Path)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--max_keypoints", type=int, default=4096)
+    parser.add_argument("--config", type=str, default="config.yaml",
+                       help="Path to configuration file")
+    
+    # Optional overrides
+    parser.add_argument("--batch_size", type=int)
+    parser.add_argument("--matching_batch_size", type=int)
+    parser.add_argument("--num_workers", type=int)
+    parser.add_argument("--max_keypoints", type=int)
     parser.add_argument("--no_fp16", action="store_true")
-    parser.add_argument("--no_compile", action="store_true")
+    parser.add_argument("--min_conf", type=float)
     
     args = parser.parse_args()
+    
+    # Load config with CLI overrides
+    config = load_config(args.config, args)
+    
+    # Use matching batch size if specified
+    if args.matching_batch_size:
+        config.batching.matching_batch_size = args.matching_batch_size
     
     features_ref = args.features_ref if args.features_ref else args.features
     
@@ -469,9 +438,5 @@ if __name__ == "__main__":
         feature_path_q=args.features,
         feature_path_r=features_ref,
         output_path=args.output,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        max_keypoints=args.max_keypoints,
-        use_fp16=not args.no_fp16,
-        compile_model=not args.no_compile
+        config=config
     )

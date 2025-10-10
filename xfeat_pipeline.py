@@ -98,67 +98,62 @@ def main(image_dir, export_dir, config, additional_pairs_file=None):
     
     # Step 1-3: Feature extraction with unified pipeline
     print(f"[1/6] Extracting features with unified GPU pipeline...")
-    # feature_args = [
-    #     "--image_dir", str(image_dir),
-    #     "--output_file", str(features_file),
-    #     "--batch_size", str(config.batching.feature_batch_size),
-    #     "--num_features", str(config.features.num_features),
-    #     "--yolo_model", config.models.yolo_model,
-    #     "--yolo_conf", str(config.human_detection.confidence_threshold),
-    #     "--mask_type", config.human_detection.mask_type,
-    #     "--mask_color", *[str(c) for c in config.human_detection.mask_color],
-    #     "--gpu_memory", str(config.gpu.max_memory_gb),
-    #     "--num_workers", str(config.batching.num_workers),
-    # ]
+    feature_args = [
+        "--image_dir", str(image_dir),
+        "--output_file", str(features_file),
+        "--batch_size", str(config.batching.feature_batch_size),
+        "--num_features", str(config.features.num_features),
+        "--num_workers", str(config.batching.num_workers),
+    ]
     
-    # if not config.gpu.use_half_precision:
-    #     feature_args.append("--no_half_precision")
+    if not config.gpu.use_half_precision:
+        feature_args.append("--no_half_precision")
     
-    # run_async_script("hloc.unify", feature_args)
+    # run_async_script("hloc.unify_v2", feature_args)
 
-    # # Step 4: Generate image pairs
-    # print(f"\n[2/6] Generating image pairs...")
-    # pair_args = [
-    #     "--image_folder", str(image_dir),
-    #     "--output_file", str(pairs_file),
-    #     "--num_matches", str(config.pairing.num_matches),
-    # ]
+    # Step 4: Generate image pairs
+    print(f"\n[2/6] Generating image pairs...")
+    pair_args = [
+        "--image_folder", str(image_dir),
+        "--output_file", str(pairs_file),
+        "--num_matches", str(config.pairing.num_matches),
+    ]
     # run_script("hloc.make_pairs", pair_args)
 
-    # # Step 4.5: Append additional pairs file if provided
-    # if additional_pairs_file:
-    #     print(f"\n[2.5/6] Appending additional pairs from {additional_pairs_file}...")
-    #     append_pairs_file(pairs_file, additional_pairs_file)
+    # Step 4.5: Append additional pairs file if provided
+    if additional_pairs_file:
+        print(f"\n[2.5/6] Appending additional pairs from {additional_pairs_file}...")
+        # append_pairs_file(pairs_file, additional_pairs_file)
 
-    # # Step 5: Match features  
-    # print(f"\n[3/6] Matching features...")
-    # match_args = [
-    #     "--pairs", str(pairs_file),
-    #     "--features", str(features_file),
-    #     "--output", str(matches_file),
-    #     "--batch_size", str(config.batching.matching_batch_size),
-    #     "--max_keypoints", str(config.features.max_keypoints),
-    #     "--num_workers", str(config.batching.num_workers),
-    # ]
+    # Step 5: Match features  
+    print(f"\n[3/6] Matching features...")
+    match_args = [
+        "--pairs", str(pairs_file),
+        "--features", str(features_file),
+        "--output", str(matches_file),
+        "--batch_size", str(config.batching.matching_batch_size),
+        "--max_keypoints", str(config.features.max_keypoints),
+        "--num_workers", str(config.batching.num_workers),
+    ]
     
-    # if not config.gpu.use_half_precision:
-    #     match_args.append("--no_fp16")
+    if not config.gpu.use_half_precision:
+        match_args.append("--no_fp16")
     
     # run_script("hloc.match_xfeat", match_args)
 
-    # # Step 6: Generate COLMAP database
-    # print(f"\n[4/6] Generating COLMAP database...")
-    # db_args = [
-    #     "--pairs", str(pairs_file),
-    #     "--image_dir", str(image_dir),
-    #     "--export_dir", str(export_dir),
-    #     "--matches", str(matches_file),
-    #     "--features", str(features_file),
-    #     "--config", str(Path(args.config).resolve()),  # Pass config file path
-    # ]
+    # Step 6: Generate COLMAP database
+    print(f"\n[4/6] Generating COLMAP database...")
+    db_args = [
+        "--pairs", str(pairs_file),
+        "--image_dir", str(image_dir),
+        "--export_dir", str(export_dir),
+        "--matches", str(matches_file),
+        "--features", str(features_file),
+        "--config", str(Path(args.config).resolve()),  # Pass config file path
+    ]
     # run_script("hloc.db", db_args)
 
-    # print(f"COLMAP database generated at: {db_path}")
+    print(f"COLMAP database generated at: {db_path}")
 
     # Step 7: Run COLMAP mapper
     print(f"\n[5/6] Running COLMAP mapper...")

@@ -1,5 +1,6 @@
 """
-Refactored XFeat Matching - Uses Centralized Config
+Refactored XFeat Matching - TensorRT Version
+Uses TensorRT for maximum inference performance
 """
 
 import torch
@@ -16,16 +17,25 @@ from torch.utils.data import Dataset, DataLoader
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-# Add parent directory for config import
-
 from hloc.config_loader import load_config, PipelineConfig
 
+# TensorRT imports
 try:
-    import cupy as cp
-    CUPY_AVAILABLE = True
+    import tensorrt as trt
+    import pycuda.driver as cuda
+    import pycuda.autoinit
+    TRT_AVAILABLE = True
 except ImportError:
-    CUPY_AVAILABLE = False
-    print("CuPy not available - using CPU spherical coordinate processing")
+    TRT_AVAILABLE = False
+    print("TensorRT not available - install with: pip install tensorrt pycuda")
+
+# ONNX fallback
+try:
+    import onnxruntime as ort
+    ONNX_AVAILABLE = True
+except ImportError:
+    ONNX_AVAILABLE = False
+    print("ONNXRuntime not available - install with: pip install onnxruntime-gpu")
 
 
 class OptimizedBatchDataset(Dataset):
@@ -116,14 +126,468 @@ def collate_fn(batch):
     }
 
 
-class OptimizedXFeatMatcher:
-    """Optimized XFeat matcher with config-based settings"""
+class TensorRTLightGlueMatcher:
+    """TensorRT-accelerated LightGlue matcher"""
     
-    def __init__(self, xfeat_model, config: PipelineConfig):
+    def __init__(self, engine_path: str, config: PipelineConfig):
+        if not TRT_AVAILABLE:
+            raise RuntimeError("TensorRT not available. Install with: pip install tensorrt pycuda")
+        
+        self.config = config
+        self.engine_path = engine_path
+        self.device = config.gpu.device
+        
+        # Load TensorRT engine
+        self.logger = trt.Logger(trt.Logger.WARNING)
+        with open(engine_path, 'rb') as f:
+            engine_data = f.read()
+        
+        runtime = trt.Runtime(self.logger)
+        self.engine = runtime.deserialize_cuda_engine(engine_data)
+        self.context = self.engine.create_execution_context()
+        
+        # Get binding information
+        self.num_bindings = self.engine.num_io_tensors
+
+        self.bindings = [None] * self.num_bindings
+        self.binding_shapes = {}
+        self.binding_names = {}
+        
+        for i in range(self.num_bindings):
+            name = self.engine.get_tensor_name(i)
+            dtype = trt.nptype(self.engine.get_tensor_dtype(name))
+            shape = self.engine.get_tensor_shape(name)
+            is_input = self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT
+            
+            self.binding_names[name] = i
+            self.binding_shapes[name] = shape
+            
+            if is_input:
+                print(f"Input {i}: {name}, shape={shape}, dtype={dtype}")
+            else:
+                print(f"Output {i}: {name}, shape={shape}, dtype={dtype}")
+        
+        # Extract dimensions
+        kpts0_shape = self.binding_shapes['kpts0']
+        self.fixed_batch_size = kpts0_shape[0]
+        self.fixed_num_keypoints = kpts0_shape[1]
+        self.descriptor_dim = self.binding_shapes['desc0'][2]
+        self.stream = cuda.Stream()
+
+        # Allocate device memory for bindings
+        self._allocate_buffers()
+        
+        print(f"TensorRT LightGlue Loaded:")
+        print(f"  Engine: {engine_path}")
+        print(f"  Fixed batch size: {self.fixed_batch_size}")
+        print(f"  Fixed num keypoints: {self.fixed_num_keypoints}")
+        print(f"  Descriptor dim: {self.descriptor_dim}")
+        self._warmup()
+        print("Warmup complete")
+
+    def _warmup(self):
+        """Run a dummy inference to warm up the engine"""
+        dummy_kpts = np.zeros((self.fixed_batch_size, self.fixed_num_keypoints, 2), dtype=np.float32)
+        dummy_desc = np.zeros((self.fixed_batch_size, self.fixed_num_keypoints, self.descriptor_dim), dtype=np.float32)
+        
+        cuda.memcpy_htod_async(self.device_buffers['kpts0'], dummy_kpts, self.stream)
+        cuda.memcpy_htod_async(self.device_buffers['kpts1'], dummy_kpts, self.stream)
+        cuda.memcpy_htod_async(self.device_buffers['desc0'], dummy_desc, self.stream)
+        cuda.memcpy_htod_async(self.device_buffers['desc1'], dummy_desc, self.stream)
+        
+        for name in self.binding_names:
+            self.context.set_tensor_address(name, int(self.device_buffers[name]))
+        
+        self.context.execute_async_v3(stream_handle=self.stream.handle)
+        self.stream.synchronize()
+        
+    def _allocate_buffers(self):
+        """Allocate GPU memory for all bindings"""
+        self.device_buffers = {}
+        self.host_buffers = {}
+        
+        for name, idx in self.binding_names.items():
+            shape = self.binding_shapes[name]
+            dtype = trt.nptype(self.engine.get_tensor_dtype(name))
+            
+            # Allocate host memory
+            size = int(np.prod(shape))
+            host_mem = cuda.pagelocked_empty(size, dtype)
+            self.host_buffers[name] = host_mem
+            
+            # Allocate device memory
+            device_mem = cuda.mem_alloc(host_mem.nbytes)
+            self.device_buffers[name] = device_mem
+            self.bindings[idx] = int(device_mem)
+    
+    def pad_to_fixed_size(self, tensor: torch.Tensor, target_size: int, dim: int = 0) -> torch.Tensor:
+        """Pad tensor to fixed size along specified dimension"""
+        current_size = tensor.shape[dim]
+        if current_size >= target_size:
+            return tensor[:target_size] if dim == 0 else tensor[:, :target_size]
+        
+        pad_size = target_size - current_size
+        if dim == 0:
+            padding = torch.zeros((pad_size, *tensor.shape[1:]), dtype=tensor.dtype, device=tensor.device)
+            return torch.cat([tensor, padding], dim=0)
+        elif dim == 1:
+            padding = torch.zeros((tensor.shape[0], pad_size, *tensor.shape[2:]), dtype=tensor.dtype, device=tensor.device)
+            return torch.cat([tensor, padding], dim=1)
+        else:
+            raise ValueError(f"Unsupported padding dimension: {dim}")
+        
+    def batch_match(self, outputs0: List[Dict], outputs1: List[Dict], min_conf: float = 0.1) -> List[Dict]:
+        """Batch match using TensorRT engine with proper synchronization"""
+        if len(outputs0) == 0:
+            return []
+        
+        valid_pairs = [(i, o0, o1) for i, (o0, o1) in enumerate(zip(outputs0, outputs1)) 
+                    if o0 is not None and o1 is not None]
+        
+        if len(valid_pairs) == 0:
+            return [{'mkpts_0': np.empty((0, 2)), 'mkpts_1': np.empty((0, 2)),
+                    'idxs_0': np.array([]), 'idxs_1': np.array([])} 
+                for _ in range(len(outputs0))]
+        
+        all_results = [None] * len(outputs0)
+        
+        for chunk_start in range(0, len(valid_pairs), self.fixed_batch_size):
+            chunk_end = min(chunk_start + self.fixed_batch_size, len(valid_pairs))
+            chunk = valid_pairs[chunk_start:chunk_end]
+            
+            # Prepare batch tensors
+            batch_kpts0 = []
+            batch_kpts1 = []
+            batch_desc0 = []
+            batch_desc1 = []
+            original_sizes0 = []
+            original_sizes1 = []
+            
+            for _, o0, o1 in chunk:
+                n0 = o0['keypoints'].shape[0]
+                n1 = o1['keypoints'].shape[0]
+                original_sizes0.append(n0)
+                original_sizes1.append(n1)
+                
+                kpts0_padded = self.pad_to_fixed_size(o0['keypoints'], self.fixed_num_keypoints, dim=0)
+                kpts1_padded = self.pad_to_fixed_size(o1['keypoints'], self.fixed_num_keypoints, dim=0)
+                desc0_padded = self.pad_to_fixed_size(o0['descriptors'], self.fixed_num_keypoints, dim=0)
+                desc1_padded = self.pad_to_fixed_size(o1['descriptors'], self.fixed_num_keypoints, dim=0)
+                
+                batch_kpts0.append(kpts0_padded)
+                batch_kpts1.append(kpts1_padded)
+                batch_desc0.append(desc0_padded)
+                batch_desc1.append(desc1_padded)
+            
+            # Pad batch to fixed batch size
+            if len(batch_kpts0) < self.fixed_batch_size:
+                device = batch_kpts0[0].device
+                while len(batch_kpts0) < self.fixed_batch_size:
+                    batch_kpts0.append(torch.zeros((self.fixed_num_keypoints, 2), dtype=torch.float32, device=device))
+                    batch_kpts1.append(torch.zeros((self.fixed_num_keypoints, 2), dtype=torch.float32, device=device))
+                    batch_desc0.append(torch.zeros((self.fixed_num_keypoints, self.descriptor_dim), dtype=torch.float32, device=device))
+                    batch_desc1.append(torch.zeros((self.fixed_num_keypoints, self.descriptor_dim), dtype=torch.float32, device=device))
+            
+            # Stack and ensure contiguous
+            kpts0_batch = np.ascontiguousarray(torch.stack(batch_kpts0, dim=0).cpu().numpy().astype(np.float32))
+            kpts1_batch = np.ascontiguousarray(torch.stack(batch_kpts1, dim=0).cpu().numpy().astype(np.float32))
+            desc0_batch = np.ascontiguousarray(torch.stack(batch_desc0, dim=0).cpu().numpy().astype(np.float32))
+            desc1_batch = np.ascontiguousarray(torch.stack(batch_desc1, dim=0).cpu().numpy().astype(np.float32))
+            
+            try:
+                # Copy inputs to GPU (async)
+                cuda.memcpy_htod_async(self.device_buffers['kpts0'], kpts0_batch, self.stream)
+                cuda.memcpy_htod_async(self.device_buffers['kpts1'], kpts1_batch, self.stream)
+                cuda.memcpy_htod_async(self.device_buffers['desc0'], desc0_batch, self.stream)
+                cuda.memcpy_htod_async(self.device_buffers['desc1'], desc1_batch, self.stream)
+                
+                # Set tensor addresses
+                for name in self.binding_names:
+                    self.context.set_tensor_address(name, int(self.device_buffers[name]))
+                
+                # Execute inference (async)
+                success = self.context.execute_async_v3(stream_handle=self.stream.handle)
+                if not success:
+                    raise RuntimeError("TensorRT execution failed")
+                
+                # Copy outputs from GPU (async)
+                cuda.memcpy_dtoh_async(self.host_buffers['matches0'], self.device_buffers['matches0'], self.stream)
+                cuda.memcpy_dtoh_async(self.host_buffers['mscores0'], self.device_buffers['mscores0'], self.stream)
+                
+                # Wait for all operations to complete
+                self.stream.synchronize()
+                
+                # Reshape outputs
+                matches0 = self.host_buffers['matches0'].reshape(self.fixed_batch_size, self.fixed_num_keypoints)
+                mscores0 = self.host_buffers['mscores0'].reshape(self.fixed_batch_size, self.fixed_num_keypoints)
+                
+            except Exception as e:
+                print(f"TensorRT inference error: {e}")
+                import traceback
+                traceback.print_exc()
+                for idx, o0, o1 in chunk:
+                    all_results[idx] = {
+                        'mkpts_0': np.empty((0, 2)),
+                        'mkpts_1': np.empty((0, 2)),
+                        'idxs_0': np.array([]),
+                        'idxs_1': np.array([])
+                    }
+                continue
+            
+            # Process results for each pair
+            for i, (orig_idx, o0, o1) in enumerate(chunk):
+                n0 = original_sizes0[i]
+                n1 = original_sizes1[i]
+                
+                pair_matches0 = matches0[i, :n0]
+                pair_scores0 = mscores0[i, :n0]
+                
+                valid_mask = (pair_matches0 >= 0) & (pair_matches0 < n1) & (pair_scores0 >= min_conf)
+                
+                if valid_mask.sum() == 0:
+                    all_results[orig_idx] = {
+                        'mkpts_0': np.empty((0, 2)),
+                        'mkpts_1': np.empty((0, 2)),
+                        'idxs_0': np.array([]),
+                        'idxs_1': np.array([])
+                    }
+                    continue
+                
+                idxs_0 = np.where(valid_mask)[0]
+                idxs_1 = pair_matches0[valid_mask].astype(np.int32)
+                
+                mkpts_0 = o0['keypoints'][idxs_0].cpu().numpy()
+                mkpts_1 = o1['keypoints'][idxs_1].cpu().numpy()
+                
+                all_results[orig_idx] = {
+                    'mkpts_0': mkpts_0,
+                    'mkpts_1': mkpts_1,
+                    'idxs_0': idxs_0,
+                    'idxs_1': idxs_1
+                }
+        
+        # Fill None results
+        for i in range(len(all_results)):
+            if all_results[i] is None:
+                all_results[i] = {
+                    'mkpts_0': np.empty((0, 2)),
+                    'mkpts_1': np.empty((0, 2)),
+                    'idxs_0': np.array([]),
+                    'idxs_1': np.array([])
+                }
+        
+        return all_results    
+    def __del__(self):
+        """Cleanup GPU memory"""
+        try:
+            for buf in self.device_buffers.values():
+                buf.free()
+        except:
+            pass
+
+
+class ONNXLightGlueMatcher:
+    """ONNX fallback matcher when TensorRT is not available"""
+    
+    def __init__(self, onnx_path: str, config: PipelineConfig):
+        if not ONNX_AVAILABLE:
+            raise RuntimeError("ONNXRuntime not available. Install with: pip install onnxruntime-gpu")
+        
+        self.config = config
+        self.onnx_path = onnx_path
+        self.device = config.gpu.device
+        
+        # Setup ONNX Runtime session
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        sess_options.intra_op_num_threads = 4
+        sess_options.inter_op_num_threads = 4
+        
+        # Configure providers
+        providers = []
+        if torch.cuda.is_available() and 'cuda' in self.device:
+            device_id = int(self.device.split(':')[1]) if ':' in self.device else 0
+            providers.append(('CUDAExecutionProvider', {
+                'device_id': device_id,
+                'arena_extend_strategy': 'kSameAsRequested',
+                'gpu_mem_limit': int(config.gpu.max_memory_gb * 1024 * 1024 * 1024),
+                'cudnn_conv_algo_search': 'DEFAULT',
+            }))
+        providers.append('CPUExecutionProvider')
+        
+        self.session = ort.InferenceSession(
+            onnx_path,
+            sess_options=sess_options,
+            providers=providers
+        )
+        
+        # Get model metadata
+        self.input_meta = {inp.name: inp for inp in self.session.get_inputs()}
+        self.output_meta = {out.name: out for out in self.session.get_outputs()}
+        
+        # Extract fixed dimensions from model
+        kpts0_shape = self.input_meta['kpts0'].shape
+
+# Check if the batch dimension is dynamic (a string)
+        if isinstance(kpts0_shape[0], str):
+            print(f"ONNX model has a dynamic batch size ('{kpts0_shape[0]}'). Using batch size from config: {config.batching.matching_batch_size}")
+            self.fixed_batch_size = config.batching.matching_batch_size
+        else:
+            self.fixed_batch_size = kpts0_shape[0]
+
+        self.fixed_num_keypoints = kpts0_shape[1]
+        self.descriptor_dim = self.input_meta['desc0'].shape[2]
+        
+        print(f"ONNX LightGlue Loaded:")
+        print(f"  Model: {onnx_path}")
+        print(f"  Providers: {self.session.get_providers()}")
+        print(f"  Fixed batch size: {self.fixed_batch_size}")
+        print(f"  Fixed num keypoints: {self.fixed_num_keypoints}")
+        print(f"  Descriptor dim: {self.descriptor_dim}")
+    
+    def pad_to_fixed_size(self, tensor: torch.Tensor, target_size: int, dim: int = 0) -> torch.Tensor:
+        """Pad tensor to fixed size along specified dimension"""
+        current_size = tensor.shape[dim]
+        if current_size >= target_size:
+            return tensor[:target_size] if dim == 0 else tensor[:, :target_size]
+        
+        pad_size = target_size - current_size
+        if dim == 0:
+            padding = torch.zeros((pad_size, *tensor.shape[1:]), dtype=tensor.dtype, device=tensor.device)
+            return torch.cat([tensor, padding], dim=0)
+        elif dim == 1:
+            padding = torch.zeros((tensor.shape[0], pad_size, *tensor.shape[2:]), dtype=tensor.dtype, device=tensor.device)
+            return torch.cat([tensor, padding], dim=1)
+        else:
+            raise ValueError(f"Unsupported padding dimension: {dim}")
+    
+    def batch_match(self, outputs0: List[Dict], outputs1: List[Dict], min_conf: float = 0.1) -> List[Dict]:
+        """Batch match using ONNX model (same implementation as before)"""
+        if len(outputs0) == 0:
+            return []
+        
+        valid_pairs = [(i, o0, o1) for i, (o0, o1) in enumerate(zip(outputs0, outputs1)) 
+                       if o0 is not None and o1 is not None]
+        
+        if len(valid_pairs) == 0:
+            return [{'mkpts_0': np.empty((0, 2)), 'mkpts_1': np.empty((0, 2)),
+                    'idxs_0': np.array([]), 'idxs_1': np.array([])} 
+                   for _ in range(len(outputs0))]
+        
+        all_results = [None] * len(outputs0)
+        
+        for chunk_start in range(0, len(valid_pairs), self.fixed_batch_size):
+            chunk_end = min(chunk_start + self.fixed_batch_size, len(valid_pairs))
+            chunk = valid_pairs[chunk_start:chunk_end]
+            
+            batch_kpts0 = []
+            batch_kpts1 = []
+            batch_desc0 = []
+            batch_desc1 = []
+            original_sizes0 = []
+            original_sizes1 = []
+            
+            for _, o0, o1 in chunk:
+                n0 = o0['keypoints'].shape[0]
+                n1 = o1['keypoints'].shape[0]
+                original_sizes0.append(n0)
+                original_sizes1.append(n1)
+                
+                kpts0_padded = self.pad_to_fixed_size(o0['keypoints'], self.fixed_num_keypoints, dim=0)
+                kpts1_padded = self.pad_to_fixed_size(o1['keypoints'], self.fixed_num_keypoints, dim=0)
+                desc0_padded = self.pad_to_fixed_size(o0['descriptors'], self.fixed_num_keypoints, dim=0)
+                desc1_padded = self.pad_to_fixed_size(o1['descriptors'], self.fixed_num_keypoints, dim=0)
+                
+                batch_kpts0.append(kpts0_padded)
+                batch_kpts1.append(kpts1_padded)
+                batch_desc0.append(desc0_padded)
+                batch_desc1.append(desc1_padded)
+            
+            while len(batch_kpts0) < self.fixed_batch_size:
+                batch_kpts0.append(torch.zeros((self.fixed_num_keypoints, 2), dtype=torch.float32))
+                batch_kpts1.append(torch.zeros((self.fixed_num_keypoints, 2), dtype=torch.float32))
+                batch_desc0.append(torch.zeros((self.fixed_num_keypoints, self.descriptor_dim), dtype=torch.float32))
+                batch_desc1.append(torch.zeros((self.fixed_num_keypoints, self.descriptor_dim), dtype=torch.float32))
+            
+            kpts0_batch = torch.stack(batch_kpts0, dim=0).cpu().numpy().astype(np.float32)
+            kpts1_batch = torch.stack(batch_kpts1, dim=0).cpu().numpy().astype(np.float32)
+            desc0_batch = torch.stack(batch_desc0, dim=0).cpu().numpy().astype(np.float32)
+            desc1_batch = torch.stack(batch_desc1, dim=0).cpu().numpy().astype(np.float32)
+            
+            try:
+                outputs = self.session.run(None, {
+                    'kpts0': kpts0_batch,
+                    'kpts1': kpts1_batch,
+                    'desc0': desc0_batch,
+                    'desc1': desc1_batch,
+                })
+                
+                matches0 = outputs[0]
+                mscores0 = outputs[1]
+                
+            except Exception as e:
+                print(f"ONNX inference error: {e}")
+                for idx, o0, o1 in chunk:
+                    all_results[idx] = {
+                        'mkpts_0': np.empty((0, 2)),
+                        'mkpts_1': np.empty((0, 2)),
+                        'idxs_0': np.array([]),
+                        'idxs_1': np.array([])
+                    }
+                continue
+            
+            for i, (orig_idx, o0, o1) in enumerate(chunk):
+                n0 = original_sizes0[i]
+                n1 = original_sizes1[i]
+                
+                pair_matches0 = matches0[i, :n0]
+                pair_scores0 = mscores0[i, :n0]
+                
+                valid_mask = (pair_matches0 >= 0) & (pair_matches0 < n1) & (pair_scores0 >= min_conf)
+                
+                if valid_mask.sum() == 0:
+                    all_results[orig_idx] = {
+                        'mkpts_0': np.empty((0, 2)),
+                        'mkpts_1': np.empty((0, 2)),
+                        'idxs_0': np.array([]),
+                        'idxs_1': np.array([])
+                    }
+                    continue
+                
+                idxs_0 = np.where(valid_mask)[0]
+                idxs_1 = pair_matches0[valid_mask].astype(np.int32)
+                
+                mkpts_0 = o0['keypoints'][idxs_0].cpu().numpy()
+                mkpts_1 = o1['keypoints'][idxs_1].cpu().numpy()
+                
+                all_results[orig_idx] = {
+                    'mkpts_0': mkpts_0,
+                    'mkpts_1': mkpts_1,
+                    'idxs_0': idxs_0,
+                    'idxs_1': idxs_1
+                }
+        
+        for i in range(len(all_results)):
+            if all_results[i] is None:
+                all_results[i] = {
+                    'mkpts_0': np.empty((0, 2)),
+                    'mkpts_1': np.empty((0, 2)),
+                    'idxs_0': np.array([]),
+                    'idxs_1': np.array([])
+                }
+        
+        return all_results
+
+
+class OptimizedXFeatMatcher:
+    """Optimized XFeat matcher with TensorRT/ONNX LightGlue"""
+    
+    def __init__(self, xfeat_model, matcher, config: PipelineConfig):
         self.config = config
         self.device = torch.device(config.gpu.device if torch.cuda.is_available() else 'cpu')
         self.xfeat = xfeat_model.to(self.device)
         self.xfeat.eval()
+        self.matcher = matcher
         
         self.use_fp16 = config.gpu.use_half_precision and self.device.type == 'cuda'
         
@@ -140,7 +604,7 @@ class OptimizedXFeatMatcher:
     
     @torch.no_grad()
     def match_batch(self, batch_data: Dict) -> List[Dict]:
-        """Process a batch of image pairs efficiently using true batch matching"""
+        """Process a batch of image pairs efficiently"""
         
         batch_size = len(batch_data['pair_names'])
         
@@ -173,108 +637,53 @@ class OptimizedXFeatMatcher:
             outputs0.append(output0)
             outputs1.append(output1)
         
-        valid_indices = [i for i in range(batch_size) if outputs0[i] is not None]
-        valid_outputs0 = [outputs0[i] for i in valid_indices]
-        valid_outputs1 = [outputs1[i] for i in valid_indices]
+        # Use TensorRT or ONNX matcher
+        matches = self.matcher.batch_match(
+            outputs0, outputs1, 
+            min_conf=self.config.matching.min_confidence
+        )
         
-        matches = []
-        if len(valid_outputs0) > 0:
-            try:
-                if hasattr(self.xfeat, 'batch_match_lighterglue'):
-                    with torch.cuda.amp.autocast(enabled=self.use_fp16):
-                        batch_matches = self.xfeat.batch_match_lighterglue(
-                            valid_outputs0, valid_outputs1, 
-                            min_conf=self.config.matching.min_confidence
-                        )
-                    matches = batch_matches
-                else:
-                    for out0, out1 in zip(valid_outputs0, valid_outputs1):
-                        with torch.cuda.amp.autocast(enabled=self.use_fp16):
-                            match_result = self._match_single(out0, out1)
-                        matches.append(match_result)
-            except Exception as e:
-                print(f"Matching error: {e}")
-                import traceback
-                traceback.print_exc()
-                matches = [{'mkpts_0': np.empty((0, 2)), 'mkpts_1': np.empty((0, 2)),
-                           'idxs_0': np.array([]), 'idxs_1': np.array([])} 
-                          for _ in range(len(valid_outputs0))]
-        
+        # Convert matches to output format
         results = []
-        valid_match_idx = 0
-        
         for i in range(batch_size):
             pair_name = '_'.join(batch_data['pair_names'][i])
             num_kpts0 = len(batch_data['keypoints0'][i])
             
-            if outputs0[i] is None:
+            if outputs0[i] is None or i >= len(matches):
                 results.append({
                     'pair_name': pair_name,
                     'matches0': torch.full((num_kpts0,), -1, dtype=torch.long),
                     'matching_scores0': torch.zeros(num_kpts0, dtype=torch.float32)
                 })
-            else:
-                match_result = matches[valid_match_idx] if valid_match_idx < len(matches) else None
-                valid_match_idx += 1
+                continue
+            
+            match_result = matches[i]
+            
+            if 'idxs_0' in match_result and len(match_result['idxs_0']) > 0:
+                matches0 = torch.full((num_kpts0,), -1, dtype=torch.long)
+                scores0 = torch.zeros(num_kpts0, dtype=torch.float32)
                 
-                if match_result and 'idxs_0' in match_result and len(match_result['idxs_0']) > 0:
-                    matches0 = torch.full((num_kpts0,), -1, dtype=torch.long)
-                    scores0 = torch.zeros(num_kpts0, dtype=torch.float32)
-                    
-                    idxs_0 = match_result['idxs_0']
-                    idxs_1 = match_result['idxs_1']
-                    
-                    for idx0, idx1 in zip(idxs_0, idxs_1):
-                        if 0 <= idx0 < num_kpts0:
-                            matches0[idx0] = idx1
-                            scores0[idx0] = 1.0
-                    
-                    results.append({
-                        'pair_name': pair_name,
-                        'matches0': matches0,
-                        'matching_scores0': scores0
-                    })
-                else:
-                    results.append({
-                        'pair_name': pair_name,
-                        'matches0': torch.full((num_kpts0,), -1, dtype=torch.long),
-                        'matching_scores0': torch.zeros(num_kpts0, dtype=torch.float32)
-                    })
+                idxs_0 = match_result['idxs_0']
+                idxs_1 = match_result['idxs_1']
+                
+                for idx0, idx1 in zip(idxs_0, idxs_1):
+                    if 0 <= idx0 < num_kpts0:
+                        matches0[idx0] = idx1
+                        scores0[idx0] = 1.0
+                
+                results.append({
+                    'pair_name': pair_name,
+                    'matches0': matches0,
+                    'matching_scores0': scores0
+                })
+            else:
+                results.append({
+                    'pair_name': pair_name,
+                    'matches0': torch.full((num_kpts0,), -1, dtype=torch.long),
+                    'matching_scores0': torch.zeros(num_kpts0, dtype=torch.float32)
+                })
         
         return results
-    
-    def _match_single(self, output0: Dict, output1: Dict) -> Dict:
-        """Fallback single pair matching using mutual nearest neighbors"""
-        desc0 = output0['descriptors']
-        desc1 = output1['descriptors']
-        
-        if len(desc0) == 0 or len(desc1) == 0:
-            return {
-                'mkpts_0': np.empty((0, 2)), 
-                'mkpts_1': np.empty((0, 2)),
-                'idxs_0': np.array([]),
-                'idxs_1': np.array([])
-            }
-        
-        sim = torch.matmul(desc0, desc1.t())
-        
-        nn01 = sim.argmax(dim=1)
-        nn10 = sim.argmax(dim=0)
-        
-        mutual = nn10[nn01] == torch.arange(len(nn01), device=sim.device)
-        
-        idx0 = torch.where(mutual)[0]
-        idx1 = nn01[mutual]
-        
-        mkpts0 = output0['keypoints'][idx0].cpu().numpy()
-        mkpts1 = output1['keypoints'][idx1].cpu().numpy()
-        
-        return {
-            'mkpts_0': mkpts0,
-            'mkpts_1': mkpts1,
-            'idxs_0': idx0.cpu().numpy(),
-            'idxs_1': idx1.cpu().numpy()
-        }
 
 
 class OptimizedWriter:
@@ -331,16 +740,18 @@ def optimized_match_from_paths(
     output_path: Path,
     config: PipelineConfig
 ) -> Path:
-    """Main optimized matching pipeline with config"""
+    """Main optimized matching pipeline with TensorRT/ONNX LightGlue"""
+    
+    use_tensorrt = config.gpu.use_tensorrt and TRT_AVAILABLE
     
     print(f"\nOptimized XFeat Matching Pipeline")
+    print(f"Backend: {'TensorRT' if use_tensorrt else 'ONNX Runtime'}")
     print(f"Configuration:")
     print(f"  Batch size: {config.batching.matching_batch_size}")
     print(f"  Workers: {config.batching.num_workers}")
     print(f"  Max keypoints: {config.features.max_keypoints}")
     print(f"  FP16: {config.gpu.use_half_precision}")
     print(f"  Min confidence: {config.matching.min_confidence}")
-    print(f"  Model compilation: {config.gpu.compile_models}")
     
     # Load pairs
     from hloc.utils.parsers import parse_retrieval
@@ -348,15 +759,28 @@ def optimized_match_from_paths(
     pairs = [(q, r) for q, rs in pairs_dict.items() for r in rs]
     print(f"Processing {len(pairs)} pairs")
     
-    # Initialize XFeat model
+    # Initialize XFeat model (without LightGlue)
     sys.path.append(config.models.xfeat_module_path)
     from modules.xfeat import XFeat
     xfeat_model = XFeat(
         weights=config.models.xfeat_weights,
         top_k=config.features.max_keypoints,
         detection_threshold=config.features.detection_threshold,
-        lightglue_checkpoint=config.models.lightglue_checkpoint  # ADD THIS
+        lightglue_checkpoint=None
     )
+    
+    # Initialize matcher (TensorRT or ONNX)
+    # if use_tensorrt:
+    if not config.models.lightglue_trt_path:
+        raise ValueError("TensorRT enabled but lightglue_trt_path not specified in config")
+    print(f"  TensorRT Engine: {config.models.lightglue_trt_path}")
+    matcher = TensorRTLightGlueMatcher(config.models.lightglue_trt_path, config)
+    # else:
+    #     if not config.models.lightglue_onnx_path:
+    #         raise ValueError("ONNX path not specified in config")
+    #     print(f"  ONNX Model: {config.models.lightglue_onnx_path}")
+    #     matcher = ONNXLightGlueMatcher(config.models.lightglue_onnx_path, config)
+    
     # Create dataset and dataloader
     dataset = OptimizedBatchDataset(
         pairs, feature_path_q, feature_path_r, config
@@ -374,7 +798,7 @@ def optimized_match_from_paths(
     )
     
     # Initialize matcher and writer
-    matcher = OptimizedXFeatMatcher(xfeat_model, config)
+    xfeat_matcher = OptimizedXFeatMatcher(xfeat_model, matcher, config)
     writer = OptimizedWriter(output_path, config)
     
     # Process batches
@@ -382,7 +806,7 @@ def optimized_match_from_paths(
         with tqdm(total=len(pairs), desc="Matching", 
                  disable=not config.logging.progress_bars) as pbar:
             for batch_idx, batch_data in enumerate(dataloader):
-                results = matcher.match_batch(batch_data)
+                results = xfeat_matcher.match_batch(batch_data)
                 writer.add_results(results)
                 pbar.update(len(results))
                 
@@ -406,7 +830,7 @@ def optimized_match_from_paths(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Optimized XFeat Matching with Config")
+    parser = argparse.ArgumentParser(description="Optimized XFeat Matching with TensorRT/ONNX")
     parser.add_argument("--pairs", type=Path, required=True)
     parser.add_argument("--features", type=Path, required=True)
     parser.add_argument("--features_ref", type=Path)
@@ -421,11 +845,20 @@ if __name__ == "__main__":
     parser.add_argument("--max_keypoints", type=int)
     parser.add_argument("--no_fp16", action="store_true")
     parser.add_argument("--min_conf", type=float)
+    parser.add_argument("--use_tensorrt", action="store_true", help="Use TensorRT instead of ONNX")
+    parser.add_argument("--trt_path", type=str, help="Override TensorRT engine path")
+    parser.add_argument("--onnx_path", type=str, help="Override ONNX model path")
     
     args = parser.parse_args()
     
     # Load config with CLI overrides
     config = load_config(args.config, args)
+    
+    # Override paths if specified
+    if args.trt_path:
+        config.models.lightglue_trt_path = args.trt_path
+    if args.onnx_path:
+        config.models.lightglue_onnx_path = args.onnx_path
     
     # Use matching batch size if specified
     if args.matching_batch_size:

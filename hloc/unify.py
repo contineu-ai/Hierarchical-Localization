@@ -1,5 +1,10 @@
 """
-Refactored Unified GPU Pipeline - Uses Centralized Config
+Simplified GPU Pipeline - CUDA Only
+
+Handles fixed ONNX batch sizes by:
+1. Detecting the model's fixed batch size from input shape
+2. Padding last batch with zeros if needed
+3. Processing only actual images (ignoring padding)
 """
 
 import numpy as np
@@ -11,13 +16,12 @@ import time
 import os
 import gc
 import sys
-from typing import List, Dict
+from typing import List, Dict, Optional
 from pathlib import Path
-from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor
-from queue import Queue
-from threading import Thread
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 import warnings
+
 warnings.filterwarnings('ignore')
 
 # Add parent directory to path for config import
@@ -30,47 +34,86 @@ try:
     CUPY_AVAILABLE = True
 except ImportError:
     CUPY_AVAILABLE = False
-    print("WARNING: CuPy not available")
+    print("ERROR: CuPy required")
+    sys.exit(1)
 
 try:
     from ultralytics import YOLO
-    ULTRALYTICS_AVAILABLE = True
 except ImportError:
-    ULTRALYTICS_AVAILABLE = False
     print("ERROR: Ultralytics required")
+    sys.exit(1)
+
+try:
+    import onnxruntime as ort
+except ImportError:
+    print("ERROR: ONNXRuntime required")
+    sys.exit(1)
 
 
-class OptimizedGPU_Convert:
-    """Optimized GPU converter with direct dicemap assembly"""
-    def __init__(self, image_shape, device='cuda:0'):
-        if not CUPY_AVAILABLE:
-            raise RuntimeError("CuPy required")
+class PerformanceMonitor:
+    """Simple performance monitoring"""
+    def __init__(self):
+        self.timings = {}
+    
+    @contextmanager
+    def timer(self, name):
+        if name not in self.timings:
+            self.timings[name] = []
         
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        yield
+        end.record()
+        torch.cuda.synchronize()
+        self.timings[name].append(start.elapsed_time(end))
+    
+    def report(self):
+        if not self.timings:
+            return
+        print("\n=== Performance Report ===")
+        for name, times in sorted(self.timings.items()):
+            times_arr = np.array(times)
+            print(f"{name:30s}: {np.mean(times_arr):7.2f}ms ± {np.std(times_arr):6.2f}ms")
+
+
+class EquirectToDicemapConverter:
+    """Convert equirectangular images to dicemaps using GPU"""
+    def __init__(self, image_shape, device='cuda:0'):
         h, w, *_ = image_shape
         self.face_size = h // 2
         self.h, self.w = h, w
-        self.device = device
+        self.device_id = int(device.split(':')[-1])
         
-        with cp.cuda.Device(int(device.split(':')[-1])):
-            self.coors_xy = self._precompute_coordinates()
-            self._precompute_dicemap_indices()
-        
-        print(f"OptimizedGPU_Convert initialized for {h}x{w}")
+        with cp.cuda.Device(self.device_id):
+            # Load or compute coordinate mappings
+            cache_dir = Path(".cache")
+            cache_dir.mkdir(exist_ok=True)
+            cache_file = cache_dir / f"coords_{h}x{w}.npy"
+            
+            if cache_file.exists():
+                self.coors_xy = cp.load(str(cache_file))
+            else:
+                self.coors_xy = self._precompute_coordinates()
+                cp.save(str(cache_file), self.coors_xy)
+            
+            self._setup_dicemap_layout()
     
     def _precompute_coordinates(self):
-        """Pre-compute all coordinate mappings"""
+        """Pre-compute coordinate mappings for cubemap sampling"""
         face_w = self.face_size
         out = cp.zeros((face_w, face_w * 6, 3), dtype=cp.float32)
         rng = cp.linspace(-0.5, 0.5, num=face_w, dtype=cp.float32)
         x_grid, y_grid = cp.meshgrid(rng, rng, indexing='xy')
         
+        # Define 6 cube faces
         faces_data = [
-            (0, x_grid, -y_grid, 0.5),
-            (1, 0.5, -y_grid, -x_grid),
-            (2, -x_grid, -y_grid, -0.5),
-            (3, -0.5, -y_grid, x_grid),
-            (4, x_grid, 0.5, y_grid),
-            (5, x_grid, -0.5, -y_grid),
+            (0, x_grid, -y_grid, 0.5),   # Front
+            (1, 0.5, -y_grid, -x_grid),  # Right
+            (2, -x_grid, -y_grid, -0.5), # Back
+            (3, -0.5, -y_grid, x_grid),  # Left
+            (4, x_grid, 0.5, y_grid),    # Top
+            (5, x_grid, -0.5, -y_grid),  # Bottom
         ]
         
         for col, x, y, z in faces_data:
@@ -80,26 +123,29 @@ class OptimizedGPU_Convert:
             out[:, start:end, 1] = y
             out[:, start:end, 2] = z
         
-        uv = self._xyz2uv(out)
-        return self._uv2coor(uv, self.h, self.w)
+        # Convert to UV coordinates
+        uv = self._xyz_to_uv(out)
+        return self._uv_to_pixel_coords(uv, self.h, self.w)
     
-    def _xyz2uv(self, xyz):
+    def _xyz_to_uv(self, xyz):
+        """Convert 3D coordinates to UV"""
         x, y, z = cp.split(xyz, 3, axis=-1)
         norm = cp.maximum(cp.sqrt(x**2 + y**2 + z**2), 1e-9)
         u = cp.arctan2(x, z)
         v = cp.arcsin(y / norm)
         return cp.concatenate([u, v], axis=-1)
     
-    def _uv2coor(self, uv, h, w):
+    def _uv_to_pixel_coords(self, uv, h, w):
+        """Convert UV to pixel coordinates"""
         u, v = cp.split(uv, 2, axis=-1)
         coor_x = (u / (2 * cp.pi) + 0.5) * w - 0.5
         coor_y = (-v / cp.pi + 0.5) * h - 0.5
         return cp.concatenate([coor_x, coor_y], axis=-1).astype(cp.float32)
     
-    def _precompute_dicemap_indices(self):
+    def _setup_dicemap_layout(self):
+        """Setup dicemap face positions"""
         fs = self.face_size
         self.dicemap_shape = (fs * 3, fs * 4)
-        
         self.face_slices = {
             'U': (slice(0, fs), slice(fs, 2*fs)),
             'L': (slice(fs, 2*fs), slice(0, fs)),
@@ -107,47 +153,41 @@ class OptimizedGPU_Convert:
             'R': (slice(fs, 2*fs), slice(2*fs, 3*fs)),
             'B': (slice(fs, 2*fs), slice(3*fs, 4*fs)),
         }
-        
-        self.cube_slices = {
-            'F': slice(0, fs),
-            'R': slice(fs, 2*fs),
-            'B': slice(2*fs, 3*fs),
-            'L': slice(3*fs, 4*fs),
-            'U': slice(4*fs, 5*fs),
-            'D': slice(5*fs, 6*fs),
-        }
     
-    def _sample_equirec_batch(self, e_imgs, coor_xy):
-        batch_size, H, W, C = e_imgs.shape
-        e_pad = cp.pad(e_imgs, ((0, 0), (1, 1), (0, 0), (0, 0)), mode="edge")
+    def _sample_equirect(self, images, coords):
+        """Sample equirectangular image at given coordinates"""
+        batch_size, H, W, C = images.shape
+        coor_x, coor_y = cp.split(coords, 2, axis=-1)
         
-        coor_x, coor_y = cp.split(coor_xy, 2, axis=-1)
-        coor_y = coor_y + 1.0
+        # Clip and wrap coordinates
+        coor_y_clipped = cp.clip(coor_y, 0, H - 1)
+        coor_x_wrapped = coor_x % W
         
-        coords_shape = coor_x.shape[:-1]
-        coords = cp.concatenate([coor_y, coor_x], axis=-1).reshape(-1, 2).T.astype(cp.float32)
+        coords_flat = cp.stack([coor_y_clipped, coor_x_wrapped], axis=-1)
+        coords_flat = coords_flat.reshape(-1, 2).T.astype(cp.float32)
         
         results = []
         for b in range(batch_size):
-            channel_results = []
+            channels = []
             for c in range(C):
-                out = cupyx.scipy.ndimage.map_coordinates(
-                    e_pad[b, :, :, c], coords, order=1, mode="wrap"
+                sampled = cupyx.scipy.ndimage.map_coordinates(
+                    images[b, :, :, c], coords_flat, order=1, mode='nearest'
                 )
-                channel_results.append(out)
-            
-            result = cp.stack(channel_results, axis=-1).reshape(coords_shape + (C,))
+                channels.append(sampled)
+            result = cp.stack(channels, axis=-1).reshape(coords.shape[:-1] + (C,))
             results.append(result)
         
         return cp.stack(results, axis=0)
     
-    def convert_batch_to_dicemaps(self, equirect_batch):
+    def convert_batch(self, equirect_batch):
+        """Convert batch of equirectangular images to dicemaps"""
         if isinstance(equirect_batch, np.ndarray):
             equirect_batch = cp.asarray(equirect_batch)
         
         batch_size = equirect_batch.shape[0]
-        cubemaps = self._sample_equirec_batch(equirect_batch, self.coors_xy)
+        cubemaps = self._sample_equirect(equirect_batch, self.coors_xy)
         
+        # Assemble into dicemap layout
         dicemap_h, dicemap_w = self.dicemap_shape
         C = equirect_batch.shape[3]
         dicemaps = cp.zeros((batch_size, dicemap_h, dicemap_w, C), 
@@ -168,211 +208,343 @@ class OptimizedGPU_Convert:
         return dicemaps
 
 
-class VectorizedCoordConverter:
-    """GPU-accelerated vectorized coordinate conversion"""
+class CoordinateConverter:
+    """Convert dicemap coordinates to equirectangular coordinates"""
     def __init__(self, face_size, eq_width, eq_height, device='cuda:0'):
         self.face_size = face_size
         self.eq_width = eq_width
         self.eq_height = eq_height
-        self.device = device
+        self.device_id = int(device.split(':')[-1])
         
-        with cp.cuda.Device(int(device.split(':')[-1])):
-            self._precompute_conversion_maps()
+        with cp.cuda.Device(self.device_id):
+            self._setup_face_regions()
     
-    def _precompute_conversion_maps(self):
+    def _setup_face_regions(self):
+        """Define face regions in dicemap"""
         fs = self.face_size
         self.face_regions = cp.array([
-            [0, fs, fs, 2*fs, 0],
-            [fs, 2*fs, 0, fs, 1],
-            [fs, 2*fs, fs, 2*fs, 2],
-            [fs, 2*fs, 2*fs, 3*fs, 3],
-            [fs, 2*fs, 3*fs, 4*fs, 4],
+            [0, fs, fs, 2*fs, 0],      # U
+            [fs, 2*fs, 0, fs, 1],      # L
+            [fs, 2*fs, fs, 2*fs, 2],   # F
+            [fs, 2*fs, 2*fs, 3*fs, 3], # R
+            [fs, 2*fs, 3*fs, 4*fs, 4], # B
         ], dtype=cp.int32)
-        
-        self.face_names = ['U', 'L', 'F', 'R', 'B']
     
-    def _face_to_xyz(self, face_id, x_face, y_face):
+    def _face_to_xyz(self, face_ids, x_face, y_face):
+        """Convert face coordinates to 3D XYZ"""
         fs = self.face_size
         u = (x_face / fs) - 0.5
         v = (y_face / fs) - 0.5
         
         xyz = cp.zeros((*u.shape, 3), dtype=cp.float32)
         
-        if face_id == 0:
-            xyz[:, 0] = u
-            xyz[:, 1] = 0.5
-            xyz[:, 2] = v
-        elif face_id == 1:
-            xyz[:, 0] = -0.5
-            xyz[:, 1] = -v
-            xyz[:, 2] = u
-        elif face_id == 2:
-            xyz[:, 0] = u
-            xyz[:, 1] = -v
-            xyz[:, 2] = 0.5
-        elif face_id == 3:
-            xyz[:, 0] = 0.5
-            xyz[:, 1] = -v
-            xyz[:, 2] = -u
-        elif face_id == 4:
-            xyz[:, 0] = -u
-            xyz[:, 1] = -v
-            xyz[:, 2] = -0.5
-        
-        return xyz
-    
-    def convert_batch(self, keypoints_batch_gpu):
-        batch_size, num_points, _ = keypoints_batch_gpu.shape
-        
-        x_dice = keypoints_batch_gpu[:, :, 0]
-        y_dice = keypoints_batch_gpu[:, :, 1]
-        
-        eq_coords = cp.zeros_like(keypoints_batch_gpu)
-        spherical_coords = cp.zeros_like(keypoints_batch_gpu)
-        
-        for i, (y_min, y_max, x_min, x_max, face_id) in enumerate(self.face_regions):
-            mask = ((x_dice >= x_min) & (x_dice < x_max) & 
-                   (y_dice >= y_min) & (y_dice < y_max))
-            
+        # Map each face to XYZ
+        for face_id in range(5):
+            mask = (face_ids == face_id)
             if not cp.any(mask):
                 continue
             
-            x_face = cp.clip(x_dice - x_min, 0, self.face_size - 1)
-            y_face = cp.clip(y_dice - y_min, 0, self.face_size - 1)
+            if face_id == 0:  # Top
+                xyz[mask, 0] = u[mask]
+                xyz[mask, 1] = 0.5
+                xyz[mask, 2] = v[mask]
+            elif face_id == 1:  # Left
+                xyz[mask, 0] = -0.5
+                xyz[mask, 1] = -v[mask]
+                xyz[mask, 2] = u[mask]
+            elif face_id == 2:  # Front
+                xyz[mask, 0] = u[mask]
+                xyz[mask, 1] = -v[mask]
+                xyz[mask, 2] = 0.5
+            elif face_id == 3:  # Right
+                xyz[mask, 0] = 0.5
+                xyz[mask, 1] = -v[mask]
+                xyz[mask, 2] = -u[mask]
+            elif face_id == 4:  # Back
+                xyz[mask, 0] = -u[mask]
+                xyz[mask, 1] = -v[mask]
+                xyz[mask, 2] = -0.5
+        
+        return xyz
+    
+    def convert_batch(self, keypoints_batch):
+        """Convert batch of dicemap keypoints to equirectangular"""
+        batch_size, num_points, _ = keypoints_batch.shape
+        
+        x_dice = keypoints_batch[:, :, 0]
+        y_dice = keypoints_batch[:, :, 1]
+        
+        # Initialize outputs
+        eq_coords = cp.zeros_like(keypoints_batch)
+        spherical_coords = cp.zeros_like(keypoints_batch)
+        face_ids = cp.full((batch_size, num_points), -1, dtype=cp.int32)
+        
+        # Determine which face each point belongs to
+        for y_min, y_max, x_min, x_max, face_id in self.face_regions:
+            mask = ((x_dice >= x_min) & (x_dice < x_max) & 
+                   (y_dice >= y_min) & (y_dice < y_max))
+            face_ids[mask] = face_id
+        
+        valid_mask = (face_ids >= 0)
+        
+        if cp.any(valid_mask):
+            # Get face-local coordinates
+            x_faces = cp.zeros_like(x_dice)
+            y_faces = cp.zeros_like(y_dice)
             
-            xyz = self._face_to_xyz(face_id, x_face[mask], y_face[mask])
+            for y_min, y_max, x_min, x_max, face_id in self.face_regions:
+                mask = (face_ids == face_id)
+                x_faces[mask] = cp.clip(x_dice[mask] - x_min, 0, self.face_size - 1)
+                y_faces[mask] = cp.clip(y_dice[mask] - y_min, 0, self.face_size - 1)
             
-            x, y, z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+            # Convert to XYZ then to spherical
+            xyz = self._face_to_xyz(face_ids, x_faces, y_faces)
+            x, y, z = xyz[:, :, 0], xyz[:, :, 1], xyz[:, :, 2]
+            
             norm = cp.sqrt(x**2 + y**2 + z**2)
             norm = cp.maximum(norm, 1e-9)
             
             lon = cp.arctan2(x, z)
-            lat = cp.arcsin(y / norm)
+            lat = cp.arcsin(cp.clip(y / norm, -1, 1))
             
+            # Convert to pixel coordinates
             u = (lon / (2 * cp.pi) + 0.5) * self.eq_width
             v = (-lat / cp.pi + 0.5) * self.eq_height
             
-            eq_coords[mask, 0] = u
-            eq_coords[mask, 1] = v
-            spherical_coords[mask, 0] = lon
-            spherical_coords[mask, 1] = lat
+            eq_coords[:, :, 0] = u
+            eq_coords[:, :, 1] = v
+            spherical_coords[:, :, 0] = lon
+            spherical_coords[:, :, 1] = lat
         
         return eq_coords, spherical_coords
 
 
+class ImageLoader:
+    """Simple batch loader for images"""
+    def __init__(self, image_paths: List[str], batch_size: int, num_workers: int):
+        self.image_paths = image_paths
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.total_batches = (len(image_paths) + batch_size - 1) // batch_size
+    
+    def _load_image(self, path: str) -> Optional[np.ndarray]:
+        """Load single image"""
+        try:
+            img = cv2.imread(path)
+            if img is None:
+                return None
+            return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        except Exception as e:
+            print(f"Error loading {path}: {e}")
+            return None
+    
+    def iter_batches(self):
+        """Iterate through batches"""
+        for i in range(0, len(self.image_paths), self.batch_size):
+            batch_paths = self.image_paths[i:i+self.batch_size]
+            
+            images = []
+            valid_paths = []
+            
+            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                futures = {executor.submit(self._load_image, p): p for p in batch_paths}
+                
+                for future in as_completed(futures):
+                    path = futures[future]
+                    img = future.result()
+                    if img is not None:
+                        images.append(img)
+                        valid_paths.append(path)
+            
+            if images:
+                # Sort to maintain order
+                sorted_pairs = sorted(zip(valid_paths, images), 
+                                     key=lambda x: batch_paths.index(x[0]))
+                valid_paths, images = zip(*sorted_pairs)
+                yield list(valid_paths), np.array(images)
+
+
 class UnifiedGPUPipeline:
-    """Optimized unified pipeline with config-based settings"""
+    """Simplified GPU pipeline using CUDA only"""
     
     def __init__(self, config: PipelineConfig):
         self.config = config
-        
-        if not CUPY_AVAILABLE or not ULTRALYTICS_AVAILABLE:
-            raise RuntimeError("CuPy and Ultralytics required")
-        
         self.device_id = int(config.gpu.device.split(':')[-1])
-        self._setup_memory_pool()
         
+        # Setup GPU memory
+        self._setup_memory()
+        
+        # Caches
         self.converter_cache = {}
         self.coord_converter_cache = {}
-        self.gpu_buffer_pool = {}
         
+        # Performance monitoring
+        self.perf_monitor = PerformanceMonitor()
+        
+        # Initialize models
         self._initialize_models()
         
-        self.prefetch_queue = Queue(maxsize=config.batching.prefetch_batches)
-        self.prefetch_thread = None
-        
-        print(f"Pipeline initialized with {config.batching.num_workers} workers")
+        print(f"Pipeline initialized (device: {config.gpu.device})")
     
-    def _setup_memory_pool(self):
+    def _setup_memory(self):
+        """Setup GPU memory pool"""
         pool_size = int(self.config.gpu.max_memory_gb * 1024**3)
-        self.memory_pool = cp.get_default_memory_pool()
-        self.pinned_memory_pool = cp.get_default_pinned_memory_pool()
-        self.memory_pool.set_limit(pool_size)
-        print(f"GPU memory pool: {self.config.gpu.max_memory_gb}GB")
+        memory_pool = cp.get_default_memory_pool()
+        memory_pool.set_limit(pool_size)
+        print(f"GPU memory limit: {self.config.gpu.max_memory_gb}GB")
     
     def _initialize_models(self):
+        """Initialize YOLO and XFeat models"""
         print("\nInitializing models...")
         
-        # YOLO
-        self.yolo_model = YOLO(self.config.models.yolo_model)
-        self.yolo_model.to(self.config.gpu.device)
+        # YOLO model
+        yolo_path = self.config.models.yolo_model
+        print(f"Loading YOLO: {yolo_path}")
+        self.yolo_model = YOLO(yolo_path)
         
-        # XFeat
-        sys.path.append(self.config.models.xfeat_module_path)
-        from modules.xfeat import XFeat
-        self.xfeat_model = XFeat(
-            weights=self.config.models.xfeat_weights,
-            top_k=self.config.features.num_features,
-            detection_threshold=self.config.features.detection_threshold,
-            lightglue_checkpoint=self.config.models.lightglue_checkpoint  # ADD THIS
-        ).eval().cuda()
-                
-        if self.config.gpu.use_half_precision:
-            self.xfeat_model = self.xfeat_model.half()
+        # XFeat ONNX model
+        onnx_path = self.config.models.xfeat_onnx_path
+        print(f"Loading XFeat: {onnx_path}")
         
+        if not os.path.exists(onnx_path):
+            raise FileNotFoundError(f"ONNX model not found: {onnx_path}")
+        
+        # ONNX session options
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        sess_options.enable_mem_pattern = True
+        
+        # CUDA execution provider
+        providers = []
+        if self.config.gpu.device.startswith('cuda'):
+            cuda_options = {
+                'device_id': self.device_id,
+                'arena_extend_strategy': 'kSameAsRequested',
+                'gpu_mem_limit': int(self.config.gpu.max_memory_gb * 0.5 * 1024**3),
+                'cudnn_conv_algo_search': 'DEFAULT',
+            }
+            providers.append(('CUDAExecutionProvider', cuda_options))
+        
+        providers.append('CPUExecutionProvider')
+        
+        # Create ONNX session
+        self.xfeat_session = ort.InferenceSession(
+            onnx_path,
+            sess_options=sess_options,
+            providers=providers
+        )
+        
+        # Check active provider
+        active_providers = self.xfeat_session.get_providers()
+        print(f"ONNX providers: {active_providers}")
+        
+        # Get model info
+        self.xfeat_input_name = self.xfeat_session.get_inputs()[0].name
+        self.xfeat_output_names = [o.name for o in self.xfeat_session.get_outputs()]
+        
+        # Get ONNX batch size (assumes first dimension is batch)
+        input_shape = self.xfeat_session.get_inputs()[0].shape
+        self.onnx_batch_size = input_shape[0] if isinstance(input_shape[0], int) else None
+        
+        if self.onnx_batch_size:
+            print(f"ONNX model has fixed batch size: {self.onnx_batch_size}")
+            # Ensure config batch size matches or is smaller
+            if self.config.batching.feature_batch_size > self.onnx_batch_size:
+                print(f"WARNING: Config batch size ({self.config.batching.feature_batch_size}) "
+                      f"exceeds ONNX batch size ({self.onnx_batch_size}). "
+                      f"Using ONNX batch size.")
+                self.config.batching.feature_batch_size = self.onnx_batch_size
+        else:
+            print("ONNX model has dynamic batch size")
+            self.onnx_batch_size = self.config.batching.feature_batch_size
+        
+        # PyTorch optimizations
         torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
         
-        if self.config.gpu.compile_models and hasattr(torch, 'compile'):
+        # Warmup
+        self._warmup_models()
+        print("Models ready\n")
+    
+    def _warmup_models(self):
+        """Warmup models"""
+        print("Warming up models...")
+        
+        # YOLO warmup
+        dummy_img = torch.randn(1, 3, 512, 512, device=self.config.gpu.device)
+        with torch.no_grad():
             try:
-                self.xfeat_model = torch.compile(
-                    self.xfeat_model, mode='max-autotune'
-                )
+                _ = self.yolo_model.predict(dummy_img, verbose=False, 
+                                           device=self.config.gpu.device)
             except:
                 pass
         
-        print("Models initialized\n")
+        # XFeat warmup - use correct batch size
+        dummy_input = np.random.rand(self.onnx_batch_size, 3, 512, 512).astype(np.float32)
+        inputs = {
+            self.xfeat_input_name: dummy_input,
+            'top_k': np.array(self.config.features.num_features, dtype=np.int64)
+        }
+        try:
+            for _ in range(3):
+                _ = self.xfeat_session.run(self.xfeat_output_names, inputs)
+        except:
+            pass
+        
+        torch.cuda.synchronize()
+        del dummy_img
+        print("Warmup complete")
     
     def _get_converter(self, h, w):
+        """Get or create converter for image size"""
         key = (h, w)
         if key not in self.converter_cache:
-            if len(self.converter_cache) >= 5:
-                self.converter_cache.pop(next(iter(self.converter_cache)))
-            
             with cp.cuda.Device(self.device_id):
-                self.converter_cache[key] = OptimizedGPU_Convert(
+                self.converter_cache[key] = EquirectToDicemapConverter(
                     (h, w, 3), self.config.gpu.device
                 )
         return self.converter_cache[key]
     
     def _get_coord_converter(self, face_size, eq_width, eq_height):
+        """Get or create coordinate converter"""
         key = (face_size, eq_width, eq_height)
         if key not in self.coord_converter_cache:
             with cp.cuda.Device(self.device_id):
-                self.coord_converter_cache[key] = VectorizedCoordConverter(
+                self.coord_converter_cache[key] = CoordinateConverter(
                     face_size, eq_width, eq_height, self.config.gpu.device
                 )
         return self.coord_converter_cache[key]
     
-    def _detect_and_mask_batch(self, dicemap_gpu):
-        B = dicemap_gpu.shape[0]
-        dicemap_bgr = dicemap_gpu[..., [2, 1, 0]]
+    def _detect_and_mask(self, dicemap_gpu):
+        """Detect humans and mask them"""
+        batch_size = dicemap_gpu.shape[0]
         
-        with cp.cuda.Device(self.device_id):
-            images_tensor = torch.as_tensor(
-                dicemap_bgr, device=self.config.gpu.device
-            ).permute(0, 3, 1, 2).float() / 255.0
+        # Convert to tensor
+        dicemap_bgr = dicemap_gpu[..., ::-1].copy()
+        images_tensor = torch.as_tensor(
+            dicemap_bgr, device=self.config.gpu.device
+        ).permute(0, 3, 1, 2).float() / 255.0
         
+        # Run YOLO detection
         with torch.no_grad():
             results = self.yolo_model.predict(
                 images_tensor,
                 conf=self.config.human_detection.confidence_threshold,
-                classes=[0],
+                classes=[0],  # Person class
                 device=self.config.gpu.device,
-                verbose=False,
-                stream=True,
-                half=self.config.gpu.use_half_precision
+                verbose=False
             )
-            
-            detections = []
-            for result in results:
-                boxes = []
-                if result.boxes is not None and len(result.boxes) > 0:
-                    xyxy = result.boxes.xyxy.cpu().numpy()
-                    boxes = [[int(x1), int(y1), int(x2-x1), int(y2-y1)] 
-                            for x1, y1, x2, y2 in xyxy]
-                detections.append(boxes)
         
+        # Extract detections
+        detections = []
+        for result in results:
+            boxes = []
+            if result.boxes is not None and len(result.boxes) > 0:
+                xyxy = result.boxes.xyxy.cpu().numpy()
+                boxes = [[int(x1), int(y1), int(x2-x1), int(y2-y1)] 
+                        for x1, y1, x2, y2 in xyxy]
+            detections.append(boxes)
+        
+        # Mask detections
         if self.config.human_detection.mask_type == 'solid_color':
             mask_color = cp.array(self.config.human_detection.mask_color, 
                                  dtype=dicemap_gpu.dtype)
@@ -380,115 +552,112 @@ class UnifiedGPUPipeline:
                 for x, y, w, h in boxes:
                     dicemap_gpu[i, y:y+h, x:x+w, :] = mask_color
         
-        del images_tensor, results, dicemap_bgr
+        del images_tensor
         return dicemap_gpu, detections
     
-    def _extract_features_optimized(self, images_gpu):
-        with cp.cuda.Device(self.device_id):
-            images_tensor = torch.as_tensor(
-                images_gpu, device=self.config.gpu.device
-            ).permute(0, 3, 1, 2).float() / 255.0
-            
-            if self.config.gpu.use_half_precision:
-                images_tensor = images_tensor.half()
+    def _extract_features(self, images_gpu):
+        """Extract features using XFeat ONNX model"""
+        # Convert to numpy
+        if isinstance(images_gpu, cp.ndarray):
+            images_np = cp.asnumpy(images_gpu)
+        else:
+            images_np = images_gpu
         
-        sub_batch_size = min(self.config.batching.feature_batch_size, 32)
+        # Prepare batch: (B, H, W, C) -> (B, C, H, W) and normalize
+        images_batch = images_np.transpose(0, 3, 1, 2).astype(np.float32) / 255.0
+        
+        actual_batch_size = len(images_batch)
+        
+        # Handle fixed ONNX batch size
+        expected_batch_size = self.onnx_batch_size
+        if actual_batch_size < expected_batch_size:
+            # Pad batch to match ONNX model's fixed batch size
+            pad_size = expected_batch_size - actual_batch_size
+            padding = np.zeros((pad_size, *images_batch.shape[1:]), dtype=np.float32)
+            images_batch_padded = np.concatenate([images_batch, padding], axis=0)
+            print(f"  Padding batch: {actual_batch_size} -> {expected_batch_size}")
+        else:
+            images_batch_padded = images_batch
+        
+        # Process batch
+        inputs = {
+            self.xfeat_input_name: images_batch_padded,
+            'top_k': np.array(self.config.features.num_features, dtype=np.int64)
+        }
+        
+        outputs = self.xfeat_session.run(self.xfeat_output_names, inputs)
+        keypoints, scores, descriptors = outputs
+        
+        # Process only actual images (not padding)
         all_results = []
+        for i in range(actual_batch_size):
+            valid_mask = scores[i] > 0
+            
+            result = {
+                'keypoints': keypoints[i][valid_mask] if np.any(valid_mask) else np.zeros((0, 2)),
+                'scores': scores[i][valid_mask] if np.any(valid_mask) else np.zeros((0,)),
+                'descriptors': descriptors[i][valid_mask] if np.any(valid_mask) else np.zeros((0, 64))
+            }
+            
+            # Pad to expected size
+            n_valid = len(result['keypoints'])
+            if n_valid < self.config.features.num_features:
+                pad_size = self.config.features.num_features - n_valid
+                result['keypoints'] = np.vstack([
+                    result['keypoints'],
+                    np.zeros((pad_size, 2), dtype=np.float32)
+                ])
+                result['scores'] = np.concatenate([
+                    result['scores'],
+                    np.zeros((pad_size,), dtype=np.float32)
+                ])
+                result['descriptors'] = np.vstack([
+                    result['descriptors'],
+                    np.zeros((pad_size, 64), dtype=np.float32)
+                ])
+            
+            all_results.append(result)
         
-        with torch.cuda.amp.autocast(enabled=self.config.gpu.use_half_precision):
-            with torch.no_grad():
-                for i in range(0, len(images_tensor), sub_batch_size):
-                    batch = images_tensor[i:i+sub_batch_size]
-                    outputs = self.xfeat_model.detectAndCompute(
-                        batch, top_k=self.config.features.num_features
-                    )
-                    
-                    for output in outputs:
-                        if isinstance(output, dict):
-                            kpts = output.get('keypoints', torch.zeros((0, 2)))
-                            desc = output.get('descriptors', torch.zeros((0, 64)))
-                            scores = output.get('scores', torch.zeros((0,)))
-                            
-                            n = len(kpts)
-                            if n < self.config.features.num_features:
-                                pad = self.config.features.num_features - n
-                                kpts = torch.cat([kpts, torch.zeros((pad, 2), device=kpts.device)])
-                                desc = torch.cat([desc, torch.zeros((pad, 64), device=desc.device)])
-                                scores = torch.cat([scores, torch.zeros(pad, device=scores.device)])
-                            
-                            all_results.append({
-                                'keypoints': kpts,
-                                'descriptors': desc,
-                                'scores': scores
-                            })
-                        else:
-                            all_results.append({
-                                'keypoints': torch.zeros((self.config.features.num_features, 2), 
-                                                        device=self.config.gpu.device),
-                                'descriptors': torch.zeros((self.config.features.num_features, 64), 
-                                                          device=self.config.gpu.device),
-                                'scores': torch.zeros(self.config.features.num_features, 
-                                                     device=self.config.gpu.device)
-                            })
-        
-        del images_tensor
         return all_results
     
     def process_batch(self, image_paths: List[str], image_batch: np.ndarray) -> Dict:
-        B, h, w = len(image_batch), image_batch[0].shape[0], image_batch[0].shape[1]
+        """Process a batch of images"""
+        batch_size = len(image_batch)
+        h, w = image_batch[0].shape[0], image_batch[0].shape[1]
         face_size = h // 2
         
-        print(f"  Processing batch of {B} images ({h}x{w})")
-        start = time.time()
-        
         with cp.cuda.Device(self.device_id):
-            t1 = time.time()
-            converter = self._get_converter(h, w)
-            dicemap_gpu = converter.convert_batch_to_dicemaps(image_batch)
-            print(f"    Dicemap: {time.time()-t1:.2f}s")
+            # Convert to dicemaps
+            with self.perf_monitor.timer("dicemap_conversion"):
+                converter = self._get_converter(h, w)
+                dicemap_gpu = converter.convert_batch(image_batch)
             
-            t2 = time.time()
-            masked_gpu, detections = self._detect_and_mask_batch(dicemap_gpu)
-            print(f"    Detect+Mask: {time.time()-t2:.2f}s")
+            # Detect and mask humans
+            with self.perf_monitor.timer("detection_masking"):
+                masked_gpu, detections = self._detect_and_mask(dicemap_gpu)
             
-            t3 = time.time()
-            feature_results = self._extract_features_optimized(masked_gpu)
-            print(f"    Features: {time.time()-t3:.2f}s")
+            # Extract features
+            with self.perf_monitor.timer("feature_extraction"):
+                feature_results = self._extract_features(masked_gpu)
             
-            t4 = time.time()
-            coord_converter = self._get_coord_converter(face_size, w, h)
+            # Convert coordinates
+            with self.perf_monitor.timer("coordinate_conversion"):
+                coord_converter = self._get_coord_converter(face_size, w, h)
+                
+                keypoints_list = [cp.asarray(f['keypoints']) for f in feature_results]
+                keypoints_gpu = cp.stack(keypoints_list)
+                
+                eq_coords_gpu, sph_coords_gpu = coord_converter.convert_batch(keypoints_gpu)
             
-            keypoints_list = []
-            for f in feature_results:
-                if isinstance(f['keypoints'], torch.Tensor):
-                    kpts_cp = cp.asarray(f['keypoints'].detach())
-                else:
-                    kpts_cp = cp.asarray(f['keypoints'])
-                keypoints_list.append(kpts_cp)
-            
-            keypoints_gpu = cp.stack(keypoints_list)
-            
-            eq_coords_gpu, sph_coords_gpu = coord_converter.convert_batch(keypoints_gpu)
-            print(f"    Coords: {time.time()-t4:.2f}s")
-            
-            t5 = time.time()
-            eq_coords = cp.asnumpy(eq_coords_gpu)
-            sph_coords = cp.asnumpy(sph_coords_gpu)
-            
-            keypoints_np = cp.asnumpy(keypoints_gpu)
-            descriptors_np = np.stack([
-                f['descriptors'].cpu().numpy() if isinstance(f['descriptors'], torch.Tensor) 
-                else f['descriptors'] for f in feature_results
-            ])
-            scores_np = np.stack([
-                f['scores'].cpu().numpy() if isinstance(f['scores'], torch.Tensor)
-                else f['scores'] for f in feature_results
-            ])
-            print(f"    Transfer: {time.time()-t5:.2f}s")
+            # Transfer to CPU
+            with self.perf_monitor.timer("gpu_to_cpu"):
+                eq_coords = cp.asnumpy(eq_coords_gpu)
+                sph_coords = cp.asnumpy(sph_coords_gpu)
+                keypoints_np = cp.asnumpy(keypoints_gpu)
+                descriptors_np = np.stack([f['descriptors'] for f in feature_results])
+                scores_np = np.stack([f['scores'] for f in feature_results])
         
-        total_humans = sum(len(d) for d in detections)
-        print(f"    Total: {time.time()-start:.2f}s | Humans: {total_humans}")
-        
+        # Package results
         results = {}
         for i, path in enumerate(image_paths):
             name = os.path.basename(path)
@@ -502,147 +671,108 @@ class UnifiedGPUPipeline:
                 'humans_detected': len(detections[i])
             }
         
+        # Cleanup
         del dicemap_gpu, masked_gpu, keypoints_gpu, eq_coords_gpu, sph_coords_gpu
-        del feature_results, keypoints_list, keypoints_np, descriptors_np, scores_np
-        torch.cuda.empty_cache()
-        if (B % 4) == 0:
-            self.memory_pool.free_all_blocks()
+        gc.collect()
         
         return results
     
-    def _write_batch_to_hdf5(self, output_file: str, batch_results: Dict, mode='w'):
+    def _write_to_hdf5(self, output_file: str, results: Dict):
+        """Write results to HDF5"""
+        mode = 'w' if not os.path.exists(output_file) else 'a'
         with h5py.File(output_file, mode) as f:
-            for name, data in batch_results.items():
+            for name, data in results.items():
                 if name in f:
                     continue
                 
                 grp = f.create_group(name)
                 for key, value in data.items():
                     if key != 'humans_detected':
-                        grp.create_dataset(
-                            key, data=value,
-                            compression='gzip', 
-                            compression_opts=self.config.io.compression_level,
-                            shuffle=True
-                        )
+                        grp.create_dataset(key, data=value, compression='gzip')
                 grp.attrs['humans_detected'] = data['humans_detected']
     
-    def _prefetch_worker(self, batches):
-        for batch_paths, batch_data in batches:
-            self.prefetch_queue.put((batch_paths, batch_data))
-        self.prefetch_queue.put(None)
-    
     def process_images(self, image_paths: List[str], output_file: str):
+        """Process all images"""
         print(f"\n=== Processing {len(image_paths)} images ===")
-        print(f"Batch size: {self.config.batching.feature_batch_size} | "
-              f"Features: {self.config.features.num_features} | "
-              f"Workers: {self.config.batching.num_workers}")
+        print(f"Batch size: {self.config.batching.feature_batch_size}")
+        print(f"Features per image: {self.config.features.num_features}")
         
-        print("\nLoading images...")
-        with ThreadPoolExecutor(max_workers=self.config.batching.num_workers) as executor:
-            loaded = list(executor.map(
-                lambda p: (p, cv2.cvtColor(cv2.imread(p), cv2.COLOR_BGR2RGB))
-                if cv2.imread(p) is not None else None,
-                image_paths
-            ))
+        start_time = time.time()
         
-        size_groups = {}
-        for item in filter(None, loaded):
-            path, img = item
-            shape = img.shape[:2]
-            size_groups.setdefault(shape, []).append((path, img))
-        
-        all_batches = []
-        for shape, group_data in size_groups.items():
-            for i in range(0, len(group_data), self.config.batching.feature_batch_size):
-                batch_data = group_data[i:i+self.config.batching.feature_batch_size]
-                paths, imgs = zip(*batch_data)
-                all_batches.append((list(paths), np.array(imgs)))
-        
-        self.prefetch_thread = Thread(
-            target=self._prefetch_worker, args=(all_batches,)
+        loader = ImageLoader(
+            image_paths,
+            self.config.batching.feature_batch_size,
+            self.config.batching.num_workers
         )
-        self.prefetch_thread.start()
         
-        total_results = 0
+        total_processed = 0
         total_humans = 0
-        first_batch = True
         
-        while True:
-            batch_item = self.prefetch_queue.get()
-            if batch_item is None:
-                break
-            
-            batch_paths, batch_images = batch_item
+        for batch_idx, (batch_paths, batch_images) in enumerate(loader.iter_batches()):
             batch_results = self.process_batch(batch_paths, batch_images)
+            self._write_to_hdf5(output_file, batch_results)
             
-            mode = 'w' if first_batch else 'a'
-            self._write_batch_to_hdf5(output_file, batch_results, mode)
-            first_batch = False
-            
-            total_results += len(batch_results)
+            total_processed += len(batch_results)
             total_humans += sum(r['humans_detected'] for r in batch_results.values())
+            
+            progress = (batch_idx + 1) / loader.total_batches * 100
+            print(f"Progress: {batch_idx+1}/{loader.total_batches} ({progress:.1f}%) | "
+                  f"{total_processed} images | {total_humans} humans")
+            
+            del batch_images, batch_results
+            gc.collect()
         
-        self.prefetch_thread.join()
+        elapsed = time.time() - start_time
         
         print(f"\n=== Complete ===")
-        print(f"Processed: {total_results} images")
-        print(f"Total humans masked: {total_humans}")
+        print(f"Processed: {total_processed} images in {elapsed:.2f}s")
+        print(f"Throughput: {total_processed/elapsed:.2f} images/sec")
+        print(f"Humans masked: {total_humans}")
         print(f"Output: {output_file}")
         
-        self._cleanup()
-    
-    def _cleanup(self):
+        self.perf_monitor.report()
+        
+        # Final cleanup
         torch.cuda.empty_cache()
-        self.memory_pool.free_all_blocks()
-        self.pinned_memory_pool.free_all_blocks()
         gc.collect()
 
 
 def find_images(directory: str) -> List[str]:
-    exts = ['.jpg', '.jpeg', '.png', '.tiff', '.tif', '.bmp', '.webp']
+    """Find all images in directory"""
+    extensions = ['.jpg', '.jpeg', '.png', '.tiff', '.tif', '.bmp', '.webp']
     images = []
     path = Path(directory)
-    for ext in exts:
+    for ext in extensions:
         images.extend(path.glob(f'*{ext}'))
         images.extend(path.glob(f'*{ext.upper()}'))
     return sorted(str(p) for p in images)
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Optimized GPU pipeline with config-based hyperparameters"
-    )
+    parser = argparse.ArgumentParser(description="Simplified GPU Pipeline (CUDA Only)")
     parser.add_argument('--image_dir', type=str, required=True)
     parser.add_argument('--output_file', type=str, default="features.h5")
-    parser.add_argument('--config', type=str, default="config.yaml",
-                       help="Path to configuration file")
+    parser.add_argument('--config', type=str, default="config.yaml")
     
     # Optional overrides
     parser.add_argument('--batch_size', type=int)
     parser.add_argument('--num_features', type=int)
-    parser.add_argument('--yolo_model', type=str)
-    parser.add_argument('--yolo_conf', type=float)
-    parser.add_argument('--mask_type', type=str)
-    parser.add_argument('--mask_color', type=int, nargs=3)
-    parser.add_argument('--gpu_memory', type=float)
-    parser.add_argument('--no_half_precision', action='store_true')
     parser.add_argument('--num_workers', type=int)
     
     args = parser.parse_args()
     
-    if not CUPY_AVAILABLE or not ULTRALYTICS_AVAILABLE:
-        print("ERROR: CuPy and Ultralytics required")
-        return
-    
-    # Load config with CLI overrides
+    # Load config
     config = load_config(args.config, args)
     
+    # Find images
     image_paths = find_images(args.image_dir)
     if not image_paths:
         print(f"No images found in {args.image_dir}")
         return
     
+    print(f"Found {len(image_paths)} images")
+    
+    # Run pipeline
     pipeline = UnifiedGPUPipeline(config)
     pipeline.process_images(image_paths, args.output_file)
 
